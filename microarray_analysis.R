@@ -777,17 +777,23 @@ if (nrow(as.data.frame(kegg)) > 0) {
 
  ##############################################################################
   
+  
  library(ggplot2)
  library(ggrepel)
  
+ # GSM isimlerini kırp (Sample_clean)
  ump_df$Sample_clean <- gsub("_.*\\.CEL$", "", ump_df$Sample)
- ggplot(ump_df, aes(x = UMAP1, y = UMAP2, label = Sample_clean)) +
-   geom_point(size = 3, color = "steelblue") +
-   ggrepel::geom_text_repel(size = 3, max.overlaps = 15) +
-   labs(title = "UMAP Plot(n=8)", x = "UMAP1", y = "UMAP2") +
+ 
+ ggplot(ump_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+   geom_point(size = 3) +
+   ggrepel::geom_text_repel(aes(label = Sample_clean), size = 3, max.overlaps = 15) +
+   labs(title = "UMAP plot (n_neighbors = 8)",
+        x = "UMAP1", y = "UMAP2") +
    theme_minimal(base_size = 15) +
    theme(
      legend.position = "right",
      plot.title = element_text(face = "bold", size = 16),
      axis.text = element_text(size = 13)
    )
+ 
+ 
