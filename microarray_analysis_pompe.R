@@ -140,6 +140,7 @@ print(de_summary)
 # -----------------------------------VOLCANO PLOT (WITH GENE NAME)--------------
 
 # Add symbol to deg_results_all
+deg_results_all <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH")
 probe_ids_all <- rownames(deg_results_all)
 
 library(biomaRt)
@@ -162,6 +163,11 @@ colors <- c("NS" = "gray",
 # Select the 20 most significant genes and remove the ones with empty/no gene symbols
 top_genes <- deg_results_all[order(deg_results_all$adj.P.Val), ][1:20, ]
 top_genes <- top_genes[!is.na(top_genes$Gene.Symbol) & top_genes$Gene.Symbol != "", ]
+
+deg_results_all$category <- "NS"
+deg_results_all$category[deg_results_all$adj.P.Val < 0.05 & abs(deg_results_all$logFC) > 1] <- "p-value and log2 FC"
+deg_results_all$category[deg_results_all$adj.P.Val < 0.05 & abs(deg_results_all$logFC) <= 1] <- "p-value"
+deg_results_all$category[deg_results_all$adj.P.Val >= 0.05 & abs(deg_results_all$logFC) > 1] <- "log2 FC"
 
 # ggplot code
 volcano_plot <- ggplot(deg_results_all, aes(x = logFC, y = -log10(P.Value), color = category)) +
@@ -374,487 +380,486 @@ ggsave("KEGG_barplot.pdf", plot = p_kegg, width = 10, height = 10)
 # 7. Examining the Results Table for
 # -----------------------------------------------------
 # If you want to open GO enrichment results as a table:
- go_df <- as.data.frame(go_bp)
- View(go_df)
- 
- library(clusterProfiler)
- library(ggplot2)
- 
- # Example: enrichKEGG output
- # kegg <- enrichKEGG(gene = entrez_ids, organism = 'hsa', pvalueCutoff = 0.05)
- 
- # Get KEGG results as a dataframe
- kegg_df <- as.data.frame(kegg)
- 
- # Select the 10 most significant (lowest p.adj) pathways
- top_kegg <- head(kegg_df[order(kegg_df$p.adjust), ], 10)
- 
- # Barplot: With ggplot2 
- ggplot(top_kegg, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
-   geom_bar(stat = "identity") +
-   scale_fill_gradient(low = "#377eb8", high = "#e41a1c") +
-   labs(
-     title = "KEGG Pathways",
-     x = "Count",
-     y = NULL,
-     fill = "p.adjust"
-   ) +
-   theme_minimal(base_size = 16)
- 
- ggsave("KEGG_barplot.png", width = 10, height = 10)
- ggsave("KEGG_barplot.pdf", width = 10, height = 10)
- 
+go_df <- as.data.frame(go_bp)
+View(go_df)
 
- # -----------------------------------miRNA ANALYSIS----------------------------
- 
- # — Completed (normalization, limma, annotation, heatmap, GO/KEGG…)
- 
- # 1. NA / Infinite value check
- if (any(is.na(expr_matrix))) {
-   expr_matrix[is.na(expr_matrix)] <- rowMeans(expr_matrix, na.rm = TRUE)[row(expr_matrix)[is.na(expr_matrix)]]
- }
- 
- if (any(is.infinite(expr_matrix))) {
-   expr_matrix[is.infinite(expr_matrix)] <- quantile(expr_matrix, 0.99, na.rm = TRUE)
- }
- 
- cat("Expression matrix size:", dim(expr_matrix), "\n")
- cat("Design matrix size:", dim(design), "\n")
- 
- # 2. Analysis with alternative simple model LM
- 
- group_list <- factor(c(rep("Control", 10), rep("Pompe", 9)), levels = c("Control", "Pompe"))
- 
- gs <- group_list
- design_simple <- model.matrix(~ gs)
- fit_simple <- lmFit(as.matrix(expr_matrix), design_simple)
- fit_simple <- eBayes(fit_simple)
- 
- deg_simple <- topTable(fit_simple, coef = "gsPompe", number = Inf,
-                        adjust.method = "BH", p.value = 0.05, lfc = 1)
- 
- write.csv(deg_simple, "Pompe_vs_Control_simple_DEGs.csv", row.names = TRUE)
- deg_table <- read.csv("Pompe_vs_Control_simple_DEGs.csv", stringsAsFactors = FALSE)
- View(deg_table)  # Shows the table in a new tab in RStudio
- 
- 
- 
- # Install the required package (hgu133plus2.db or Adding symbols with biomaRt annotation)
- 
- if (!requireNamespace("hgu133plus2.db")) BiocManager::install("hgu133plus2.db")
- library(hgu133plus2.db)
- library(biomaRt)
- 
- # … (your annotation code will be here)
- # 3. Retrieve the probe IDs in order.
- probe_ids <- rownames(deg_table)
- 
- # 4. Match the symbol with select() (ENTREZID, GENENAME can also be added if desired)
- anno_df <- select(hgu133plus2.db,
-                   keys = probe_ids,
-                   columns = c("SYMBOL", "GENENAME"),
-                   keytype = "PROBEID")
- 
- # 5. Merge the resulting annotation table with the original DEG table.
- # (note the order! - probeID must be unique)
- deg_table$SYMBOL <- anno_df$SYMBOL[match(probe_ids, anno_df$PROBEID)]
- deg_table$GENENAME <- anno_df$GENENAME[match(probe_ids, anno_df$PROBEID)]
- write.csv(deg_table, "DEG_Table_Annotated.csv")  # Save the results
- 
- # 6. WebGestaltR + miRNA analysis
- 
- if (!require("WebGestaltR", quietly=TRUE)) {
-   BiocManager::install("WebGestaltR")
-   library(WebGestaltR)
- }
- significant_genes <- unique(deg_results$Gene.Symbol[!is.na(deg_results$Gene.Symbol)])
- available_dbs <- WebGestaltR::listGeneSet(organism="hsapiens")
- miRNA_dbs <- available_dbs[grep("miRNA", available_dbs$name, ignore.case=TRUE), ]
- print(miRNA_dbs)
- 
- # 7. PATHWAY analysis via WebGestaltR
- pathway_result <- WebGestaltR(
-   enrichMethod="ORA", organism="hsapiens",
-   enrichDatabase="pathway_KEGG",
-   interestGene=significant_genes,
-   interestGeneType="genesymbol", referenceSet="genome",
-   minNum=5, fdrThr=0.05,
-   isOutput=TRUE, outputDirectory=getwd(),
-   projectName="Pompe_Pathway_Analysis"
- )
- View(pathway_result)  # View in RStudio
- top_pw <- head(pathway_result[order(pathway_result$FDR), ], 10)
- barplot(-log10(top_pw$FDR), names.arg=top_pw$description, las=2, cex.names=0.7,
-         main="Top KEGG pathways", ylab="-log10(FDR)", col="skyblue")
- 
- 
- # 8. validated (simplified) with multiMiR
- 
- # 8a. Query only reliable and working databases (except targetscan)
- if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
- library(multiMiR)
- 
- # Start with a short list of genes
- test_genes <- head(significant_genes, 10)
- 
- mm_fast <- tryCatch({
-   get_multimir(
-     org = "hsa",
-     target = test_genes,
-     table = "validated",
-     summary = TRUE
-   )
- }, error = function(e) {
-   message("Query error: ", e$message)
-   return(NULL)
- })
- 
- if (!is.null(mm_fast)) {
-   # Just get the mirTarBase records!
-   mirtarbase_data <- subset(mm_fast@data, database == "mirtarbase")
-   print(head(mirtarbase_data))
-   
-   # Visualize miRNA target count
-   mmr_sum <- with(mirtarbase_data, tapply(type, mature_mirna_id, length))
-   top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-   barplot(top_mmrs, las = 2, col = "darkred", main = "mirTarBase: Top miRNA Target Count")
- } else {
-   cat("Could not retrieve data from multiMiR query.\n")
- }
- 
- ###############################################################################
- 
- if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
- library(multiMiR)
- library(ggplot2)
- 
- # 1. Use a short list of genes for testing
- test_genes <- head(significant_genes, 10)
- 
- # 2. Query and pivot table for each database
- databases <- c("mirtarbase", "mirecords", "tarbase")
- df_list <- list()
- 
- for (db in databases) {
-   mm_db <- tryCatch({
-     get_multimir(
-       org = "hsa",
-       target = test_genes,
-       table = "validated",
-       summary = TRUE
-     )
-   }, error = function(e) return(NULL))
-   
-   if (!is.null(mm_db)) {
-     db_data <- subset(mm_db@data, database == db)
-     if (nrow(db_data) > 0) {
-       # miRNA target number
-       mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
-       top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-       df_tmp <- data.frame(
-         miRNA = names(top_mmrs),
-         Target_Count = as.numeric(top_mmrs),
-         Database = db
-       )
-       df_list[[db]] <- df_tmp
-     }
-   }
- }
- 
- # 3. Single combined data.frame
- df_all <- do.call(rbind, df_list)
- 
- # 4. Barplot - Comparison in a single chart
- ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
-   geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.7) +
-   labs(title = "Top miRNAs by Database (Validated)", x = "miRNA", y = "Number of Validated Targets") +
-   theme_minimal(base_size = 13) +
-   coord_flip()
- 
-################################################################################
- 
- #Create df containing miRNA target number
- library(ggplot2)
- 
- df_mirtar <- data.frame(
-   miRNA = names(top_mmrs),
-   Target_Count = as.numeric(top_mmrs)
- )
- 
- # If necessary, sort miRNA names (largest to smallest)
- df_mirtar$miRNA <- factor(df_mirtar$miRNA, levels = df_mirtar$miRNA[order(df_mirtar$Target_Count)])
- 
- # Barplot (ggplot2, horizontal and color)
- ggplot(df_mirtar, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
-   geom_bar(stat = "identity", width = 0.7) +
-   coord_flip() +
-   scale_fill_gradient(low = "#FFBABA", high = "#B22222") + # Red tones
-   theme_minimal(base_size = 14) +
-   labs(title = "mirTarBase: Top miRNA Target Count",
-        x = "miRNA",
-        y = "Number of Validated Targets",
-        fill = "Target Count")
- 
-################################################################################
- 
- library(ggplot2)
- 
- mirna_info <- data.frame(
-   miRNA = c("hsa-miR-628-3p", "hsa-miR-5011-5p", "hsa-miR-3923", "hsa-miR-3121-3p", 
-             "hsa-miR-190a-3p", "hsa-miR-107", "hsa-miR-103a-3p", 
-             "hsa-miR-199b-3p", "hsa-miR-199a-5p", "hsa-miR-155-5p"),
-   Target_Count = c(6,6,6,6,6,6,5,4,4,4),  # The numbers in your analysis
-   Function = c(
-     "Tumor suppression, inflammation",
-     "Emerging, neuro/cancer",
-     "Cell cycle, apoptosis",
-     "Growth, proliferation",
-     "Neural, cardiovascular disease",
-     "Insulin resistance, tumor suppression",
-     "Glucose/lipid metabolism",
-     "Tumor suppression, fibrosis",
-     "Cardiovascular, cancer, fibrosis",
-     "Immunity, inflammation, cancer"
-   )
- )
- 
- ggplot(mirna_info, aes(x = Target_Count, y = reorder(miRNA, Target_Count), fill = Target_Count)) +
-   geom_bar(stat = "identity", width = 0.7) +
-   geom_text(aes(label = Function), hjust = -0.02, size = 3.2) +
-   scale_fill_gradient(low = "#FFBABA", high = "#B22222") +
-   labs(title = "Top miRNAs (mirTarBase) with Functions",
-        x = "Number of Validated Targets",
-        y = "miRNA") +
-   theme_minimal(base_size = 14) +
-   xlim(0, max(mirna_info$Target_Count)+2)  # Space for functions
- 
-################################################################################ 
- 
- if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
- if (!require("ggplot2", quietly=TRUE)) install.packages("ggplot2")
- library(multiMiR)
- library(ggplot2)
- 
- test_genes <- head(significant_genes, 10)
- 
- mm <- tryCatch({
-   get_multimir(
-     org = "hsa",
-     target = test_genes,             # (validated, summary TRUE)
-     table = "validated",
-     summary = TRUE
-   )
- }, error = function(e) {
-   message("Query error: ", e$message)
-   return(NULL)
- })
- 
- # Analysis and barplot cycle for each database
- if (!is.null(mm)) {
-   all_db <- unique(mm@data$database)
-   
-   for (db in all_db) {
-     cat("\n\n---", db, "results ---\n")
-     db_data <- subset(mm@data, database == db)
-     if (nrow(db_data) == 0) next
-     
-     # Calculate the number of miRNA targets
-     mirna_counts <- with(db_data, tapply(type, mature_mirna_id, length))
-     top_mirs <- head(sort(mirna_counts, decreasing = TRUE), 10)
-     
-     # Convert to table
-     df <- data.frame(
-       miRNA = names(top_mirs),
-       Target_Count = as.numeric(top_mirs)
-     )
-     df$miRNA <- factor(df$miRNA, levels = df$miRNA[order(df$Target_Count)])
-     
-     # Barplot
-     p <- ggplot(df, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
-       geom_bar(stat = "identity", width = 0.7) +
-       coord_flip() +
-       scale_fill_gradient(low = "#FFBABA", high = "#B22222") +
-       theme_minimal(base_size = 14) +
-       labs(title = paste(db, "Top miRNA Target Count"),
-            x = "miRNA",
-            y = "Number of Validated Targets",
-            fill = "Target Count")
-     
-     print(p)
-   }
-   
- } else {
-   cat("Could not retrieve data from multiMiR query.\n")
- }
- 
-################################################################################ 
- 
+library(clusterProfiler)
+library(ggplot2)
 
- if (!require("multiMiR", quietly = TRUE)) BiocManager::install("multiMiR")
- library(multiMiR)
- 
- test_genes <- head(significant_genes, 10)
- 
- mm_pred <- tryCatch({
-   get_multimir(
-     org = "hsa",
-     target = test_genes,
-     table = "predicted",    # predicted database!
-     summary = TRUE
-   )
- }, error = function(e) {
-   message("Query error: ", e$message)
-   return(NULL)
- })
- 
- if (!is.null(mm_pred)) {
-   print(unique(mm_pred@data$database))
-   print(head(mm_pred@data, 10))
-   
-   db_counts <- table(mm_pred@data$database)
-   print(db_counts)
-   
-   # Barplot: Number of targets from each database
-   barplot(db_counts,
-           col = "cornflowerblue",
-           main = "multiMiR: Predicted Database Counts",
-           xlab = "Database",
-           ylab = "Number of Targets",
-           las = 2, cex.names = 0.9)
-   
-   # You can also show the most targeted miRNAs:
-   
-   mmr_sum <- with(mm_pred@data, tapply(type, mature_mirna_id, length))
-   top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-   barplot(top_mmrs,
-           las = 2,
-           col = "darkblue",
-           main = "Predicted: Top miRNA Target Count",
-           ylab = "Target Count")
-   
- } else {
-   cat("Data could not be retrieved from databases predicted with multiMiR.\n")
- }
- 
- ###############################################################################
- 
- library(ggplot2)
- df_pred <- data.frame(
-   miRNA = names(top_mmrs),
-   Target_Count = as.numeric(top_mmrs)
- )
- ggplot(df_pred, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
-   geom_bar(stat = "identity", width = 0.7) +
-   coord_flip() +
-   scale_fill_gradient(low = "#9BD6FF", high = "#03396C") +
-   theme_minimal(base_size = 14) +
-   labs(title = "Predicted: Top miRNA Target Count",
-        x = "miRNA",
-        y = "Number of Predicted Targets",
-        fill = "Target Count")
- 
- ################################################################################
- 
- if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
- library(multiMiR)
- library(ggplot2)
- library(dplyr)
- 
- dbs <- c("targetscan", "mirdb", "miranda", "pita", "pictar",
-          "micrornaorg", "diana_microt", "mirbridge", "elmmmo", "pharcomir")
- 
- test_genes <- head(significant_genes, 10) 
- 
- df_list <- list()
- for (db in dbs) {
-   mm_db <- tryCatch({
-     get_multimir(
-       org = "hsa",
-       target = test_genes,
-       table = "predicted",   # predicted database search!
-       summary = TRUE
-     )
-   }, error = function(e) return(NULL))
-   
-   if (!is.null(mm_db)) {
-     db_data <- subset(mm_db@data, database == db)
-     if (nrow(db_data) > 0) {
-       mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
-       top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-       df_tmp <- data.frame(
-         miRNA = names(top_mmrs),
-         Target_Count = as.numeric(top_mmrs),
-         Database = db
-       )
-       df_list[[db]] <- df_tmp
-     }
-   }
- }
- 
- df_all <- bind_rows(df_list)
- 
- ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
-   geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
-   labs(title = "Top miRNAs by Predicted Database (multiMiR)", 
-        x = "miRNA", y = "Number of Predicted Targets") +
-   theme_minimal(base_size = 10) +
-   coord_flip() +
-   theme(axis.text.y = element_text(size = 7))
+# Example: enrichKEGG output
+# kegg <- enrichKEGG(gene = entrez_ids, organism = 'hsa', pvalueCutoff = 0.05)
 
- ###############################################################################
- 
- # 8b. UMAP and quality control charts
- 
- install.packages(c("umap", "ggplot2", "ggrepel"))
- library(umap)
- 
- # 1. Remove missing (NA) and duplicate rows
- expr2 <- na.omit(expr_matrix)                  # Remove gene/probe rows that are NA
- expr2 <- expr2[!duplicated(rownames(expr2)), ] # Remove duplicate rows
- 
- # 2. UMAP Analysis (if rows are gene/probe and columns are samples, transpose!)
- ump <- umap(t(expr2), n_neighbors = 8, random_state = 123)
- 
- # (e.g., if you have a group vector)
- gs <- as.factor(groups)
- 
- plot(ump$layout,
-      main = "UMAP plot (n_neighbors=8)",
-      xlab = "UMAP1", ylab = "UMAP2",
-      col = gs, pch = 20, cex = 1.5)
- legend("topright", legend = levels(gs), col = 1:length(levels(gs)), pch = 20)
- 
- # sample names: rownames(ump$layout)
- ump_df <- data.frame(
-   Sample = rownames(ump$layout),
-   UMAP1 = ump$layout[,1],
-   UMAP2 = ump$layout[,2],
-   Group = as.factor(gs)   # your group vector should be here!
- )
- 
- plot(ump$layout,
-      main = "UMAP plot (n_neighbors=8)",
-      xlab = "UMAP1", ylab = "UMAP2",
-      col = gs, pch = 20, cex = 1.5)
- legend("topright", legend = levels(gs), col = 1:length(levels(gs)), pch = 20)
+# Get KEGG results as a dataframe
+kegg_df <- as.data.frame(kegg)
 
- ##############################################################################
+# Select the 10 most significant (lowest p.adj) pathways
+top_kegg <- head(kegg_df[order(kegg_df$p.adjust), ], 10)
+
+# Barplot: With ggplot2 
+ggplot(top_kegg, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "#377eb8", high = "#e41a1c") +
+  labs(
+    title = "KEGG Pathways",
+    x = "Count",
+    y = NULL,
+    fill = "p.adjust"
+  ) +
+  theme_minimal(base_size = 16)
+
+ggsave("KEGG_barplot.png", width = 10, height = 10)
+ggsave("KEGG_barplot.pdf", width = 10, height = 10)
+
+
+# -----------------------------------miRNA ANALYSIS----------------------------
+
+# — Completed (normalization, limma, annotation, heatmap, GO/KEGG…)
+
+# 1. NA / Infinite value check
+if (any(is.na(expr_matrix))) {
+  expr_matrix[is.na(expr_matrix)] <- rowMeans(expr_matrix, na.rm = TRUE)[row(expr_matrix)[is.na(expr_matrix)]]
+}
+
+if (any(is.infinite(expr_matrix))) {
+  expr_matrix[is.infinite(expr_matrix)] <- quantile(expr_matrix, 0.99, na.rm = TRUE)
+}
+
+cat("Expression matrix size:", dim(expr_matrix), "\n")
+cat("Design matrix size:", dim(design), "\n")
+
+# 2. Analysis with alternative simple model LM
+
+group_list <- factor(c(rep("Control", 10), rep("Pompe", 9)), levels = c("Control", "Pompe"))
+
+gs <- group_list
+design_simple <- model.matrix(~ gs)
+fit_simple <- lmFit(as.matrix(expr_matrix), design_simple)
+fit_simple <- eBayes(fit_simple)
+
+deg_simple <- topTable(fit_simple, coef = "gsPompe", number = Inf,
+                       adjust.method = "BH", p.value = 0.05, lfc = 1)
+
+write.csv(deg_simple, "Pompe_vs_Control_simple_DEGs.csv", row.names = TRUE)
+deg_table <- read.csv("Pompe_vs_Control_simple_DEGs.csv", stringsAsFactors = FALSE)
+View(deg_table)  # Shows the table in a new tab in RStudio
+
+
+
+# Install the required package (hgu133plus2.db or Adding symbols with biomaRt annotation)
+
+if (!requireNamespace("hgu133plus2.db")) BiocManager::install("hgu133plus2.db")
+library(hgu133plus2.db)
+library(biomaRt)
+
+# … (your annotation code will be here)
+# 3. Retrieve the probe IDs in order.
+probe_ids <- rownames(deg_table)
+
+# 4. Match the symbol with select() (ENTREZID, GENENAME can also be added if desired)
+anno_df <- select(hgu133plus2.db,
+                  keys = probe_ids,
+                  columns = c("SYMBOL", "GENENAME"),
+                  keytype = "PROBEID")
+
+# 5. Merge the resulting annotation table with the original DEG table.
+# (note the order! - probeID must be unique)
+deg_table$SYMBOL <- anno_df$SYMBOL[match(probe_ids, anno_df$PROBEID)]
+deg_table$GENENAME <- anno_df$GENENAME[match(probe_ids, anno_df$PROBEID)]
+write.csv(deg_table, "DEG_Table_Annotated.csv")  # Save the results
+
+# 6. WebGestaltR + miRNA analysis
+
+if (!require("WebGestaltR", quietly=TRUE)) {
+  BiocManager::install("WebGestaltR")
+  library(WebGestaltR)
+}
+significant_genes <- unique(deg_results$Gene.Symbol[!is.na(deg_results$Gene.Symbol)])
+available_dbs <- WebGestaltR::listGeneSet(organism="hsapiens")
+miRNA_dbs <- available_dbs[grep("miRNA", available_dbs$name, ignore.case=TRUE), ]
+print(miRNA_dbs)
+
+# 7. PATHWAY analysis via WebGestaltR
+pathway_result <- WebGestaltR(
+  enrichMethod="ORA", organism="hsapiens",
+  enrichDatabase="pathway_KEGG",
+  interestGene=significant_genes,
+  interestGeneType="genesymbol", referenceSet="genome",
+  minNum=5, fdrThr=0.05,
+  isOutput=TRUE, outputDirectory=getwd(),
+  projectName="Pompe_Pathway_Analysis"
+)
+View(pathway_result)  # View in RStudio
+top_pw <- head(pathway_result[order(pathway_result$FDR), ], 10)
+barplot(-log10(top_pw$FDR), names.arg=top_pw$description, las=2, cex.names=0.7,
+        main="Top KEGG pathways", ylab="-log10(FDR)", col="skyblue")
+
+
+# 8. validated (simplified) with multiMiR
+
+# 8a. Query only reliable and working databases (except targetscan)
+if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
+library(multiMiR)
+
+# Start with a short list of genes
+test_genes <- head(significant_genes, 10)
+
+mm_fast <- tryCatch({
+  get_multimir(
+    org = "hsa",
+    target = test_genes,
+    table = "validated",
+    summary = TRUE
+  )
+}, error = function(e) {
+  message("Query error: ", e$message)
+  return(NULL)
+})
+
+if (!is.null(mm_fast)) {
+  # Just get the mirTarBase records!
+  mirtarbase_data <- subset(mm_fast@data, database == "mirtarbase")
+  print(head(mirtarbase_data))
   
- library(ggplot2)
- library(ggrepel)
- 
- # Trim GSM names (Sample_clean)
- ump_df$Sample_clean <- gsub("_.*\\.CEL$", "", ump_df$Sample)
- 
- ggplot(ump_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
-   geom_point(size = 3) +
-   ggrepel::geom_text_repel(aes(label = Sample_clean), size = 3, max.overlaps = 15) +
-   labs(title = "UMAP plot (n_neighbors = 8)",
-        x = "UMAP1", y = "UMAP2") +
-   theme_minimal(base_size = 15) +
-   theme(
-     legend.position = "right",
-     plot.title = element_text(face = "bold", size = 16),
-     axis.text = element_text(size = 13)
-   )
- 
+  # Visualize miRNA target count
+  mmr_sum <- with(mirtarbase_data, tapply(type, mature_mirna_id, length))
+  top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+  barplot(top_mmrs, las = 2, col = "darkred", main = "mirTarBase: Top miRNA Target Count")
+} else {
+  cat("Could not retrieve data from multiMiR query.\n")
+}
+
+###############################################################################
+
+if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
+library(multiMiR)
+library(ggplot2)
+
+# 1. Use a short list of genes for testing
+test_genes <- head(significant_genes, 10)
+
+# 2. Query and pivot table for each database
+databases <- c("mirtarbase", "mirecords", "tarbase")
+df_list <- list()
+
+for (db in databases) {
+  mm_db <- tryCatch({
+    get_multimir(
+      org = "hsa",
+      target = test_genes,
+      table = "validated",
+      summary = TRUE
+    )
+  }, error = function(e) return(NULL))
+  
+  if (!is.null(mm_db)) {
+    db_data <- subset(mm_db@data, database == db)
+    if (nrow(db_data) > 0) {
+      # miRNA target number
+      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
+      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+      df_tmp <- data.frame(
+        miRNA = names(top_mmrs),
+        Target_Count = as.numeric(top_mmrs),
+        Database = db
+      )
+      df_list[[db]] <- df_tmp
+    }
+  }
+}
+
+# 3. Single combined data.frame
+df_all <- do.call(rbind, df_list)
+
+# 4. Barplot - Comparison in a single chart
+ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.7) +
+  labs(title = "Top miRNAs by Database (Validated)", x = "miRNA", y = "Number of Validated Targets") +
+  theme_minimal(base_size = 13) +
+  coord_flip()
+
+################################################################################
+
+#Create df containing miRNA target number
+library(ggplot2)
+
+df_mirtar <- data.frame(
+  miRNA = names(top_mmrs),
+  Target_Count = as.numeric(top_mmrs)
+)
+
+# If necessary, sort miRNA names (largest to smallest)
+df_mirtar$miRNA <- factor(df_mirtar$miRNA, levels = df_mirtar$miRNA[order(df_mirtar$Target_Count)])
+
+# Barplot (ggplot2, horizontal and color)
+ggplot(df_mirtar, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(low = "#FFBABA", high = "#B22222") + # Red tones
+  theme_minimal(base_size = 14) +
+  labs(title = "mirTarBase: Top miRNA Target Count",
+       x = "miRNA",
+       y = "Number of Validated Targets",
+       fill = "Target Count")
+
+################################################################################
+
+library(ggplot2)
+
+mirna_info <- data.frame(
+  miRNA = c("hsa-miR-628-3p", "hsa-miR-5011-5p", "hsa-miR-3923", "hsa-miR-3121-3p", 
+            "hsa-miR-190a-3p", "hsa-miR-107", "hsa-miR-103a-3p", 
+            "hsa-miR-199b-3p", "hsa-miR-199a-5p", "hsa-miR-155-5p"),
+  Target_Count = c(6,6,6,6,6,6,5,4,4,4),  # The numbers in your analysis
+  Function = c(
+    "Tumor suppression, inflammation",
+    "Emerging, neuro/cancer",
+    "Cell cycle, apoptosis",
+    "Growth, proliferation",
+    "Neural, cardiovascular disease",
+    "Insulin resistance, tumor suppression",
+    "Glucose/lipid metabolism",
+    "Tumor suppression, fibrosis",
+    "Cardiovascular, cancer, fibrosis",
+    "Immunity, inflammation, cancer"
+  )
+)
+
+ggplot(mirna_info, aes(x = Target_Count, y = reorder(miRNA, Target_Count), fill = Target_Count)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(label = Function), hjust = -0.02, size = 3.2) +
+  scale_fill_gradient(low = "#FFBABA", high = "#B22222") +
+  labs(title = "Top miRNAs (mirTarBase) with Functions",
+       x = "Number of Validated Targets",
+       y = "miRNA") +
+  theme_minimal(base_size = 14) +
+  xlim(0, max(mirna_info$Target_Count)+2)  # Space for functions
+
+################################################################################ 
+
+if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
+if (!require("ggplot2", quietly=TRUE)) install.packages("ggplot2")
+library(multiMiR)
+library(ggplot2)
+
+test_genes <- head(significant_genes, 10)
+
+mm <- tryCatch({
+  get_multimir(
+    org = "hsa",
+    target = test_genes,             # (validated, summary TRUE)
+    table = "validated",
+    summary = TRUE
+  )
+}, error = function(e) {
+  message("Query error: ", e$message)
+  return(NULL)
+})
+
+# Analysis and barplot cycle for each database
+if (!is.null(mm)) {
+  all_db <- unique(mm@data$database)
+  
+  for (db in all_db) {
+    cat("\n\n---", db, "results ---\n")
+    db_data <- subset(mm@data, database == db)
+    if (nrow(db_data) == 0) next
+    
+    # Calculate the number of miRNA targets
+    mirna_counts <- with(db_data, tapply(type, mature_mirna_id, length))
+    top_mirs <- head(sort(mirna_counts, decreasing = TRUE), 10)
+    
+    # Convert to table
+    df <- data.frame(
+      miRNA = names(top_mirs),
+      Target_Count = as.numeric(top_mirs)
+    )
+    df$miRNA <- factor(df$miRNA, levels = df$miRNA[order(df$Target_Count)])
+    
+    # Barplot
+    p <- ggplot(df, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
+      geom_bar(stat = "identity", width = 0.7) +
+      coord_flip() +
+      scale_fill_gradient(low = "#FFBABA", high = "#B22222") +
+      theme_minimal(base_size = 14) +
+      labs(title = paste(db, "Top miRNA Target Count"),
+           x = "miRNA",
+           y = "Number of Validated Targets",
+           fill = "Target Count")
+    
+    print(p)
+  }
+  
+} else {
+  cat("Could not retrieve data from multiMiR query.\n")
+}
+
+################################################################################ 
+
+
+if (!require("multiMiR", quietly = TRUE)) BiocManager::install("multiMiR")
+library(multiMiR)
+
+test_genes <- head(significant_genes, 10)
+
+mm_pred <- tryCatch({
+  get_multimir(
+    org = "hsa",
+    target = test_genes,
+    table = "predicted",    # predicted database!
+    summary = TRUE
+  )
+}, error = function(e) {
+  message("Query error: ", e$message)
+  return(NULL)
+})
+
+if (!is.null(mm_pred)) {
+  print(unique(mm_pred@data$database))
+  print(head(mm_pred@data, 10))
+  
+  db_counts <- table(mm_pred@data$database)
+  print(db_counts)
+  
+  # Barplot: Number of targets from each database
+  barplot(db_counts,
+          col = "cornflowerblue",
+          main = "multiMiR: Predicted Database Counts",
+          xlab = "Database",
+          ylab = "Number of Targets",
+          las = 2, cex.names = 0.9)
+  
+  # You can also show the most targeted miRNAs:
+  
+  mmr_sum <- with(mm_pred@data, tapply(type, mature_mirna_id, length))
+  top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+  barplot(top_mmrs,
+          las = 2,
+          col = "darkblue",
+          main = "Predicted: Top miRNA Target Count",
+          ylab = "Target Count")
+  
+} else {
+  cat("Data could not be retrieved from databases predicted with multiMiR.\n")
+}
+
+###############################################################################
+
+library(ggplot2)
+df_pred <- data.frame(
+  miRNA = names(top_mmrs),
+  Target_Count = as.numeric(top_mmrs)
+)
+ggplot(df_pred, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient(low = "#9BD6FF", high = "#03396C") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Predicted: Top miRNA Target Count",
+       x = "miRNA",
+       y = "Number of Predicted Targets",
+       fill = "Target Count")
+
+################################################################################
+
+if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
+library(multiMiR)
+library(ggplot2)
+library(dplyr)
+
+dbs <- c("targetscan", "mirdb", "miranda", "pita", "pictar",
+         "micrornaorg", "diana_microt", "mirbridge", "elmmmo", "pharcomir")
+
+test_genes <- head(significant_genes, 10) 
+
+df_list <- list()
+for (db in dbs) {
+  mm_db <- tryCatch({
+    get_multimir(
+      org = "hsa",
+      target = test_genes,
+      table = "predicted",   # predicted database search!
+      summary = TRUE
+    )
+  }, error = function(e) return(NULL))
+  
+  if (!is.null(mm_db)) {
+    db_data <- subset(mm_db@data, database == db)
+    if (nrow(db_data) > 0) {
+      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
+      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+      df_tmp <- data.frame(
+        miRNA = names(top_mmrs),
+        Target_Count = as.numeric(top_mmrs),
+        Database = db
+      )
+      df_list[[db]] <- df_tmp
+    }
+  }
+}
+
+df_all <- bind_rows(df_list)
+
+ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  labs(title = "Top miRNAs by Predicted Database (multiMiR)", 
+       x = "miRNA", y = "Number of Predicted Targets") +
+  theme_minimal(base_size = 10) +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 7))
+
+###############################################################################
+
+# 8b. UMAP and quality control charts
+
+install.packages(c("umap", "ggplot2", "ggrepel"))
+library(umap)
+
+# 1. Remove missing (NA) and duplicate rows
+expr2 <- na.omit(expr_matrix)                  # Remove gene/probe rows that are NA
+expr2 <- expr2[!duplicated(rownames(expr2)), ] # Remove duplicate rows
+
+# 2. UMAP Analysis (if rows are gene/probe and columns are samples, transpose!)
+ump <- umap(t(expr2), n_neighbors = 8, random_state = 123)
+
+# (e.g., if you have a group vector)
+gs <- as.factor(groups)
+
+plot(ump$layout,
+     main = "UMAP plot (n_neighbors=8)",
+     xlab = "UMAP1", ylab = "UMAP2",
+     col = gs, pch = 20, cex = 1.5)
+legend("topright", legend = levels(gs), col = 1:length(levels(gs)), pch = 20)
+
+# sample names: rownames(ump$layout)
+ump_df <- data.frame(
+  Sample = rownames(ump$layout),
+  UMAP1 = ump$layout[,1],
+  UMAP2 = ump$layout[,2],
+  Group = as.factor(gs)   # your group vector should be here!
+)
+
+plot(ump$layout,
+     main = "UMAP plot (n_neighbors=8)",
+     xlab = "UMAP1", ylab = "UMAP2",
+     col = gs, pch = 20, cex = 1.5)
+legend("topright", legend = levels(gs), col = 1:length(levels(gs)), pch = 20)
+
+##############################################################################
+
+library(ggplot2)
+library(ggrepel)
+
+# Trim GSM names (Sample_clean)
+ump_df$Sample_clean <- gsub("_.*\\.CEL$", "", ump_df$Sample)
+
+ggplot(ump_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(aes(label = Sample_clean), size = 3, max.overlaps = 15) +
+  labs(title = "UMAP plot (n_neighbors = 8)",
+       x = "UMAP1", y = "UMAP2") +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text = element_text(size = 13)
+  )
