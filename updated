@@ -1,0 +1,827 @@
+# ========================== SETUP (Colab/R) ===================================
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("GEOquery","affy","limma","Biobase","hgu133plus2.db","R.utils"),
+                     ask = FALSE, update = TRUE)
+
+library(GEOquery)
+library(affy)
+library(limma)
+library(Biobase)
+library(hgu133plus2.db)
+library(R.utils)
+
+# ========================== PARAMS ============================================
+gse_id  <- "GSE38680"
+base_dir <- "/content/geo"
+dir.create(base_dir, showWarnings = FALSE, recursive = TRUE)
+setwd(base_dir)
+
+# ========================== 1) FENOTİP VERİSİNİ ÇEK ===========================
+# Series matrix içinden örnek meta bilgileri (Diagnosis, Title, Patient vb.)
+gse_list <- getGEO(gse_id, GSEMatrix = TRUE)
+gse <- gse_list[[1]]
+pheno <- pData(gse)
+
+# Önemli alanları normalize edelim (kolon adları bazen değişebilir)
+# Diagnosis bilgisi "diagnosis: Control/Pompe" gibi characteristics alanında olabilir.
+# Aşağıda yaygın adları toplayıp tek kolon yapıyoruz.
+char_cols <- grep("characteristics", colnames(pheno), value = TRUE)
+diag_vec <- rep(NA_character_, nrow(pheno))
+for (cc in char_cols) {
+  hit <- sub(".*[Dd]iagnosis[:= ]+", "", pheno[[cc]])
+  hit[grepl("Control", hit, ignore.case = TRUE)] <- "Control"
+  hit[grepl("Pompe",   hit, ignore.case = TRUE)] <- "Pompe"
+  diag_vec[is.na(diag_vec) & hit %in% c("Control","Pompe")] <- hit
+}
+if (all(is.na(diag_vec)) && "diagnosis:ch1" %in% tolower(colnames(pheno))) {
+  # nadir durumlar için yedek
+  diag_vec <- pheno[["diagnosis:ch1"]]
+}
+
+pheno$Diagnosis_clean <- factor(diag_vec, levels = c("Control","Pompe"))
+
+# ========================== 2) CEL DOSYALARINI İNDİR / AÇ =====================
+supp_dir <- file.path(base_dir, gse_id)
+getGEOSuppFiles(GEO = gse_id, makeDirectory = TRUE, baseDir = base_dir)
+
+# .tar(.gz) paketlerinin içini açalım
+tar_files <- list.files(supp_dir, pattern = "\\.tar(\\.gz)?$", full.names = TRUE)
+cel_dir <- file.path(supp_dir, "CEL"); dir.create(cel_dir, showWarnings = FALSE)
+
+if (length(tar_files) > 0) {
+  for (tf in tar_files) {
+    message("Extracting: ", tf)
+    if (grepl("\\.tar\\.gz$", tf)) {
+      tgz <- sub("\\.gz$", "", tf)
+      R.utils::gunzip(tf, destname = tgz, overwrite = TRUE, remove = FALSE)
+      utils::untar(tgz, exdir = cel_dir)
+    } else {
+      utils::untar(tf, exdir = cel_dir)
+    }
+  }
+} else {
+  # Bazı seriler CEL'leri doğrudan .CEL.gz olarak tutar
+  cel_dir <- supp_dir
+}
+
+# Varsa .CEL.gz dosyalarını aç
+gz_cels <- list.files(cel_dir, pattern = "\\.CEL(\\.gz)?$", full.names = TRUE, ignore.case = TRUE)
+if (length(gz_cels) == 0) {
+  stop("CEL dosyası bulunamadı. list.files(supp_dir, recursive = TRUE) ile kontrol edin.")
+}
+for (f in gz_cels) if (grepl("\\.gz$", f)) R.utils::gunzip(f, overwrite = TRUE, remove = TRUE)
+
+# ========================== 3) OKU & NORMALİZE (RMA) ==========================
+gset_raw <- ReadAffy(celfile.path = cel_dir)
+eset <- rma(gset_raw)
+expr_matrix <- exprs(eset)
+
+# ========================== 4) GSM EŞLEŞTİRME =================================
+# Affy örnek adlarından GSM'leri çıkar (dosya adından veya sampleNames'ten)
+sn <- sampleNames(eset)
+gsm_from_sn <- sub(".*(GSM[0-9]+).*", "\\1", sn, ignore.case = TRUE)
+
+# Series matrix'teki sıra ile eşleşme
+# pheno rownames’i genelde GSM’dir; değilse GSM kolonuna bakarız
+rown_gsm <- rownames(pheno)
+if (!all(grepl("^GSM[0-9]+$", rown_gsm))) {
+  # Bazı durumlarda "geo_accession" alanı olur
+  if ("geo_accession" %in% colnames(pheno)) rown_gsm <- pheno$geo_accession
+}
+
+# expr kolon sırasına göre pheno’yu yeniden sıralayalım
+match_idx <- match(gsm_from_sn, rown_gsm)
+if (any(is.na(match_idx))) {
+  stop("Fenotip ile ifade matrisindeki örnekler eşleşemedi: ",
+       paste(sn[is.na(match_idx)], collapse = ", "))
+}
+pheno_aligned <- pheno[match_idx, , drop = FALSE]
+stopifnot(ncol(expr_matrix) == nrow(pheno_aligned))
+
+# ========================== 5) GRUP VE DİZAYN =================================
+groups <- pheno_aligned$Diagnosis_clean
+if (any(is.na(groups))) {
+  # Yedek: Source name veya Title üzerinden kontrol/pompe ayır
+  src <- pheno_aligned$source_name_ch1
+  groups[is.na(groups) & grepl("Control", src, ignore.case = TRUE)] <- "Control"
+  groups[is.na(groups) & grepl("Pompe",   src, ignore.case = TRUE)] <- "Pompe"
+  groups <- factor(groups, levels = c("Control","Pompe"))
+}
+table(groups)  # Beklenen: Control=10, Pompe=9 (toplam 19 CEL mevcutsa)
+
+design <- model.matrix(~0 + groups)
+colnames(design) <- levels(groups)
+
+# ========================== 6) limma DE ANALİZİ ===============================
+fit  <- lmFit(expr_matrix, design)
+cont <- makeContrasts(PompeVsControl = Pompe - Control, levels = design)
+fit2 <- contrasts.fit(fit, cont)
+fit2 <- eBayes(fit2)
+deg  <- topTable(fit2, coef = "PompeVsControl", n = Inf, adjust.method = "BH")
+
+# ========================== 7) KAYDET / ÖZET ==================================
+write.csv(expr_matrix, file = file.path(base_dir, "GSE38680_RMA_expression.csv"))
+write.csv(pheno_aligned, file = file.path(base_dir, "GSE38680_pheno_aligned.csv"))
+write.csv(deg, file = file.path(base_dir, "GSE38680_DE_limma.csv"))
+
+head(deg)
+
+
+# ============================== Pompe DEG – FAIR & Reviewer-Ready ==============================
+# Author: <adınız>
+# Version: 1.1  |  Seeded, QC'd, Batch-aware, FDR-proof
+# ===============================================================================================
+
+# ---- 0) PREP: packages, paths, seed, session log ---------------------------------------------
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs <- c("affy","limma","Biobase","hgu133plus2.db","annotate","genefilter","sva",
+          "ggplot2","ggrepel","pheatmap","data.table")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p, ask = FALSE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(20240724)
+
+# Çalışma kökü: bu dosyanın olduğu dizin kök kabul edilir
+root <- here::here()
+dir.create(file.path(root,"results","qc"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(root,"results","deg"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(root,"results","plots"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(root,"logs"), recursive = TRUE, showWarnings = FALSE)
+
+# Ortam bilgisini kaydet (FAIR: Reusable)
+writeLines(c(capture.output(sessionInfo())), file.path(root,"logs","session_info.txt"))
+
+# ---- 1) METADATA: pheno tablosu + MELAS etiketi ----------------------------------------------
+# pheno.csv şablonu:
+# sample,group,filename,batch,age,sex,rin,is_melas
+# GSM947461,Control,GSM947461_H0013501.CEL,1,,,
+# GSM947470,Control,GSM947470_H0013503.CEL,2,,,,"FALSE"
+# GSM947470,Control,GSM947470_H0013503.CEL,2,,,,"TRUE"   # örnek
+
+pheno <- data.table::fread(file.path(root,"pheno.csv"))
+stopifnot(all(c("sample","group","filename") %in% names(pheno)))
+pheno$group   <- factor(pheno$group, levels = c("Control","Pompe"))
+pheno$is_melas <- ifelse(is.na(pheno$is_melas), FALSE, as.logical(pheno$is_melas))
+if (!"batch" %in% names(pheno)) pheno$batch <- NA
+
+# ---- 2) GİRDİ: CEL okuma + RMA ---------------------------------------------------------------
+cel_dir <- root  # CEL'ler bu klasördeyse; değilse yolunu ver
+cel_files <- file.path(cel_dir, pheno$filename)
+if (!all(file.exists(cel_files))) stop("Eksik CEL dosyası: ", paste(pheno$filename[!file.exists(cel_files)], collapse=", "))
+
+raw <- ReadAffy(filenames = cel_files)
+Biobase::pData(raw) <- as.data.frame(pheno)  # metadata bağlı
+eset <- rma(raw)
+expr <- Biobase::exprs(eset)
+
+# ---- 3) QC: low-expression filtresi (IQR) + PCA, outlier gözlemi ------------------------------
+iqr <- apply(expr, 1, IQR)
+thr <- quantile(iqr, 0.20, na.rm = TRUE)   # alt %20 IQR dışarı
+keep <- iqr > thr
+expr_f <- expr[keep, ]
+message("Low-expression removed: ", sum(!keep), " probes (", round(mean(!keep)*100,2), "%)")
+write.csv(data.frame(probe=rownames(expr)[!keep], IQR=iqr[!keep]),
+          file.path(root,"results","qc","low_expression_removed.csv"), row.names = FALSE)
+
+# PCA ile QC (FAIR: şeffaflık)
+pca <- prcomp(t(expr_f), scale. = TRUE)
+pca_df <- data.frame(pca$x[,1:2], group = pheno$group, batch = pheno$batch, sample = pheno$sample)
+gg <- ggplot(pca_df, aes(PC1, PC2, color = group, shape = factor(batch), label = sample)) +
+  geom_point(size=3) + ggrepel::geom_text_repel(size=2.8) +
+  theme_bw(14) + labs(title="PCA – RMA + IQR filtre", shape = "batch")
+ggplot2::ggsave(file.path(root,"results","qc","pca_groups_batches.png"), gg, width=9, height=7)
+
+# ---- 4) BATCH/SVA (opsiyonel ama önerilir) ----------------------------------------------------
+# Eğer belirgin batch kümelenmesi varsa:
+do_combat <- any(!is.na(pheno$batch))
+if (do_combat) {
+  mod0 <- model.matrix(~ group, data = pheno)
+  batch_vec <- as.factor(pheno$batch)
+  expr_cb  <- ComBat(dat = expr_f, batch = batch_vec, mod = mod0, par.prior = TRUE, prior.plots = FALSE)
+} else {
+  expr_cb <- expr_f
+}
+
+# SVA (gizli değişkenler; küçük n’de faydalı olabilir)
+try({
+  mod  <- model.matrix(~ group, data = pheno)
+  mod0 <- model.matrix(~ 1, data = pheno)
+  svobj <- sva(expr_cb, mod, mod0)
+  sva_mat <- svobj$sv
+}, silent = TRUE)
+
+# ---- 5) DİZAYN MATRİSİ: kovaryatlar + SVA -----------------------------------------------------
+# mevcut kovaryatlar (varsa) eklenir: batch eklemiyoruz çünkü ComBat ile düzelttik
+covars <- c("age","sex","rin")
+covars <- covars[covars %in% names(pheno)]
+design_df <- data.frame(group = pheno$group, pheno[, covars, drop=FALSE])
+if (exists("sva_mat")) {
+  colnames(sva_mat) <- paste0("SV", seq_len(ncol(sva_mat)))
+  design_df <- cbind(design_df, sva_mat)
+}
+design <- model.matrix(~ 0 + ., data = design_df)
+colnames(design)[1:2] <- c("Control","Pompe")  # ilk iki sütun grup dummies
+
+# ---- 6) LİMMA + BH-FDR: DEG seçimi ------------------------------------------------------------
+fit  <- lmFit(expr_cb, design)
+cont <- makeContrasts(Pompe - Control, levels = design)
+fit2 <- eBayes(contrasts.fit(fit, cont))
+
+# anotasyon
+probes <- rownames(expr_cb)
+sym    <- annotate::getSYMBOL(probes, "hgu133plus2.db")
+genenm <- annotate::getGENENAME(probes, "hgu133plus2.db")
+
+tt_all <- topTable(fit2, coef=1, number=Inf, adjust.method="BH")
+tt_all$SYMBOL  <- sym[rownames(tt_all)]
+tt_all$GENENAME<- genenm[rownames(tt_all)]
+
+# probe→gene tekilleştirme (en yüksek |logFC|)
+tt_all$abs_logFC <- abs(tt_all$logFC)
+tt_gene <- tt_all[!is.na(tt_all$SYMBOL) & nzchar(tt_all$SYMBOL), ]
+tt_gene <- tt_gene[order(tt_gene$SYMBOL, -tt_gene$abs_logFC), ]
+tt_gene <- tt_gene[!duplicated(tt_gene$SYMBOL), ]  # her gen için 1 satır
+
+# FDR < 0.05 ile DEG
+deg <- subset(tt_gene, adj.P.Val < 0.05)
+
+# kayıt (FAIR: Findable/Reusable)
+write.csv(tt_all,  file.path(root,"results","deg","all_probes_BH.csv"))
+write.csv(tt_gene, file.path(root,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
+write.csv(deg,     file.path(root,"results","deg","DEG_FDR_lt_0.05.csv"), row.names = TRUE)
+
+# Volcano (FDR ekseni)
+library(ggplot2); library(ggrepel)
+volc <- ggplot(tt_gene, aes(logFC, -log10(adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), alpha=.7, size=1.6) +
+  geom_vline(xintercept = c(-1,1), linetype="dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+  scale_color_manual(values=c("grey70","tomato")) +
+  theme_bw(14) + labs(title="Volcano (BH-FDR gösterimi)", color="FDR<0.05")
+ggsave(file.path(root,"results","plots","volcano_FDR.png"), volc, width=8, height=6)
+
+# ---- 7) MELAS duyarlılık analizi --------------------------------------------------------------
+has_melas <- any(pheno$is_melas)
+if (has_melas) {
+  keep_idx <- which(!pheno$is_melas)
+  expr_sens <- expr_cb[, keep_idx]
+  ph_sens   <- droplevels(pheno[keep_idx, ])
+
+  # yeniden tasarım
+  design_s <- model.matrix(~ 0 + group, data = ph_sens)
+  colnames(design_s) <- levels(ph_sens$group)
+  fit_s  <- lmFit(expr_sens, design_s)
+  cont_s <- makeContrasts(Pompe - Control, levels = design_s)
+  fit_s2 <- eBayes(contrasts.fit(fit_s, cont_s))
+
+  tts <- topTable(fit_s2, coef=1, number=Inf, adjust.method="BH")
+  tts$SYMBOL <- annotate::getSYMBOL(rownames(tts), "hgu133plus2.db")
+  tts <- tts[!is.na(tts$SYMBOL) & nzchar(tts$SYMBOL), ]
+  tts$abs_logFC <- abs(tts$logFC)
+  tts <- tts[order(tts$SYMBOL, -tts$abs_logFC), ]
+  tts <- tts[!duplicated(tts$SYMBOL), ]
+  deg_sens <- subset(tts, adj.P.Val < 0.05)
+
+  # örtüşme raporu
+  overlap <- length(intersect(deg$SYMBOL, deg_sens$SYMBOL))
+  msg <- sprintf("MELAS dahil DEG: %d | MELAS hariç DEG: %d | ortak: %d",
+                 nrow(deg), nrow(deg_sens), overlap)
+  message(msg)
+  writeLines(msg, file.path(root,"results","deg","MELAS_sensitivity_summary.txt"))
+  write.csv(deg_sens, file.path(root,"results","deg","DEG_noMELAS_FDR_lt_0.05.csv"))
+}
+
+message("Bitti. n_DEG (FDR<0.05) = ", nrow(deg))
+
+
+
+
+# =================== DEG RESULTS (FAIR + FDR-consistent) =====================
+
+# 0) Klasörler ve oturum bilgisi
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+library(here)
+dir.create(here("results","deg"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here("results","plots"), recursive = TRUE, showWarnings = FALSE)
+
+# 1) Paketler (biomaRt yalnızca yedek)
+if (!requireNamespace("hgu133plus2.db", quietly = TRUE)) BiocManager::install("hgu133plus2.db")
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+if (!requireNamespace("ggrepel", quietly = TRUE)) install.packages("ggrepel")
+
+library(hgu133plus2.db)
+library(annotate)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+
+# 2) Tam tablo (BH-FDR ile) — DEG seçimi FDR<0.05
+tt_all <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH")
+# Yerel anotasyon (FAIR-Interoperable)
+probes <- rownames(tt_all)
+tt_all$SYMBOL  <- annotate::getSYMBOL(probes, "hgu133plus2.db")
+tt_all$GENENAME<- annotate::getGENENAME(probes, "hgu133plus2.db")
+
+# 2a) (Opsiyonel yedek) biomaRt yalnızca boş kalan semboller için
+if (any(is.na(tt_all$SYMBOL) | tt_all$SYMBOL=="")) {
+  if (!requireNamespace("biomaRt", quietly = TRUE)) BiocManager::install("biomaRt", ask = FALSE)
+  library(biomaRt)
+  try({
+    mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+    miss <- rownames(tt_all)[is.na(tt_all$SYMBOL) | tt_all$SYMBOL==""]
+    bm   <- getBM(attributes = c("affy_hg_u133_plus_2","hgnc_symbol"),
+                  filters = "affy_hg_u133_plus_2", values = miss, mart = mart)
+    tt_all$SYMBOL[match(bm$affy_hg_u133_plus_2, rownames(tt_all))] <- bm$hgnc_symbol
+  }, silent = TRUE)
+}
+
+# 3) Probe→gene tekilleştirme (en yüksek |logFC| temsilci)
+tt_all$abs_logFC <- abs(tt_all$logFC)
+tt_gene <- tt_all[!is.na(tt_all$SYMBOL) & nzchar(tt_all$SYMBOL), ]
+tt_gene <- tt_gene[order(tt_gene$SYMBOL, -tt_gene$abs_logFC), ]
+tt_gene <- tt_gene[!duplicated(tt_gene$SYMBOL), ]  # her gen için tek satır
+
+# 4) DEG listesi (FDR < 0.05) — (|log2FC| eşiği görselleştirme içindir, seçim FDR ile)
+DEG_FDR_CUTOFF <- 0.05
+deg <- subset(tt_gene, adj.P.Val < DEG_FDR_CUTOFF)
+
+# 5) Kayıt (FAIR-Findable/Reusable)
+write.csv(tt_all,  here("results","deg","all_probes_with_annotations_BH.csv"))
+write.csv(tt_gene, here("results","deg","collapsed_by_gene_maxAbsLogFC.csv"))
+write.csv(deg,     here("results","deg","DEG_FDR_lt_0.05_geneLevel.csv"))
+
+# Küçük örneklem/batch notu için kısa özet bırak
+note <- sprintf("DEG (FDR<%.2g): %d gene(s). Sample sizes — Pompe: %d, Control: %d. Batch assessed upstream.",
+                DEG_FDR_CUTOFF, nrow(deg),
+                sum(groups == "Pompe"), sum(groups == "Control"))
+writeLines(note, here("results","deg","_DEG_summary.txt"))
+
+# 6) VOLCANO — FDR ekseninde ve tutarlı eşikler
+LFC_VISUAL_THR <- 1
+volc <- ggplot(tt_gene, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < DEG_FDR_CUTOFF), alpha = 0.75, size = 1.8) +
+  geom_vline(xintercept = c(-LFC_VISUAL_THR, LFC_VISUAL_THR), linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = -log10(DEG_FDR_CUTOFF), linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("grey70","tomato"), labels = c("FDR ≥ cutoff","FDR < cutoff")) +
+  labs(title = "Volcano (FDR-based)", x = expression(Log[2]~FC), y = expression(-log[10]~FDR), color = NULL) +
+  theme_bw(base_size = 14)
+# En düşük FDR’li 20 gen etiketle
+lab20 <- head(tt_gene[order(tt_gene$adj.P.Val), c("SYMBOL","logFC","adj.P.Val")], 20)
+volc <- volc + ggrepel::geom_text_repel(data = lab20,
+                                        aes(label = SYMBOL, x = logFC, y = -log10(adj.P.Val)),
+                                        size = 3, max.overlaps = Inf)
+ggsave(here("results","plots","volcano_FDR_consistent.png"), volc, width = 8, height = 6)
+ggsave(here("results","plots","volcano_FDR_consistent.pdf"), volc, width = 8, height = 6)
+
+# 7) HEATMAP — FDR’e göre sıralı top N tekilleştirilmiş gen
+TOP_N <- min(50, nrow(deg))  # en çok 50
+if (TOP_N >= 2) {
+  top_syms <- head(deg$SYMBOL[order(deg$adj.P.Val)], TOP_N)
+  # expr_matrix prob-düzeyinde; gene-level matrise dönüştürelim (sembole karşılık gelen probun ifadesi)
+  # (temsilci prob = tt_gene’de seçilen prob)
+  reps <- rownames(tt_gene)[match(top_syms, tt_gene$SYMBOL)]
+  expr_top <- expr_matrix[reps, , drop = FALSE]
+  rownames(expr_top) <- top_syms
+  annotation_col <- data.frame(Group = groups)
+  rownames(annotation_col) <- colnames(expr_top)
+  ph <- pheatmap(expr_top, scale = "row", show_rownames = TRUE,
+                 annotation_col = annotation_col, main = paste0("Top ", TOP_N, " DEG (FDR<0.05)"))
+  ggsave(here("results","plots","heatmap_top_FDR.png"), ph, width = 8, height = 10)
+}
+
+# 8) Yüksek çözünürlüklü ortak figür (Volcano + Heatmap) — PDF
+if (exists("ph")) {
+  if (!requireNamespace("gridExtra", quietly = TRUE)) install.packages("gridExtra")
+  library(gridExtra); library(grid)
+  pdf(here("results","plots","volcano_heatmap_FDR.pdf"), width = 16, height = 8, family = "Times")
+  grid.arrange(
+    arrangeGrob(volc, top = textGrob("A", gp = gpar(fontsize=22, fontface="bold"), x = unit(0, "npc"), hjust = 0)),
+    arrangeGrob(ph$gtable, top = textGrob("B", gp = gpar(fontsize=22, fontface="bold"), x = unit(0, "npc"), hjust = 0)),
+    ncol = 2
+  )
+  dev.off()
+}
+# ============================================================================#
+
+
+
+
+# ======================= GO & KEGG — FAIR + FDR + Universe =======================
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+need_bioc <- c("clusterProfiler","org.Hs.eg.db","enrichplot","DOSE","GOSemSim")
+for (p in need_bioc) if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p, ask = FALSE)
+need_cran <- c("ggplot2","ggrepel","jsonlite")
+for (p in need_cran) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+
+library(here); library(clusterProfiler); library(org.Hs.eg.db); library(enrichplot)
+library(DOSE); library(GOSemSim); library(ggplot2); library(ggrepel); library(jsonlite)
+
+# ------------------ 0) Klasörler ------------------
+out_dir <- here::here("results","enrichment")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+plot_dir <- here::here("results","plots")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ------------------ 1) Girdi listeleri ------------------
+# Öncelikli: önceki patch'ten gelen 'deg' (FDR<0.05) ve 'tt_gene'
+if (!exists("deg") || !"SYMBOL" %in% names(deg)) {
+  # Geriye dönük üret: deg_results varsa FDR<0.05 seç
+  if (!exists("deg_results")) stop("Neither 'deg' nor 'deg_results' found. Run DEG step first.")
+  # deg_results adj.P.Val sahasına sahipse kullan
+  if (!"adj.P.Val" %in% names(deg_results)) stop("'deg_results' must include adj.P.Val. Re-run DEG with BH.")
+  tmp <- deg_results
+  # varsa sembol kolonu adı harmonize et
+  sym_col <- if ("Gene.Symbol" %in% names(tmp)) "Gene.Symbol" else if ("SYMBOL" %in% names(tmp)) "SYMBOL" else NULL
+  if (is.null(sym_col)) stop("No gene symbol column found in 'deg_results'.")
+  tmp$SYMBOL <- tmp[[sym_col]]
+  # gene-level tekilleştirme için abs logFC ile temsilci prob seçimi
+  tmp$abs_logFC <- abs(tmp$logFC)
+  tmp <- tmp[!is.na(tmp$SYMBOL) & nzchar(tmp$SYMBOL), ]
+  tmp <- tmp[order(tmp$SYMBOL, -tmp$abs_logFC), ]
+  tt_gene <- tmp[!duplicated(tmp$SYMBOL), ]  # her gen 1 satır
+  deg <- subset(tt_gene, adj.P.Val < 0.05)
+}
+
+significant_genes <- unique(deg$SYMBOL)
+
+# Universe (arka plan): tüm test edilen genler (tekilleştirilmiş)
+if (!exists("tt_gene")) stop("tt_gene (collapsed gene table) not found. Create it in DEG step.")
+universe_symbols <- unique(tt_gene$SYMBOL)
+
+# ------------------ 2) ID dönüşümü ------------------
+sym2entrez <- bitr(universe_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+entrez_universe <- unique(na.omit(sym2entrez$ENTREZID))
+
+sig2entrez <- bitr(significant_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+entrez_sig <- unique(na.omit(sig2entrez$ENTREZID))
+
+# ------------------ 3) Parametre/provenans kaydı ------------------
+meta <- list(
+  time = as.character(Sys.time()),
+  n_sig_genes = length(significant_genes),
+  n_universe_genes = length(universe_symbols),
+  n_sig_entrez = length(entrez_sig),
+  n_universe_entrez = length(entrez_universe),
+  adjust_method = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+writeLines(toJSON(meta, pretty = TRUE), file.path(out_dir, "_enrichment_params.json"))
+
+# ------------------ 4) GO: Biological Process (universe + BH) ------------------
+go_bp <- enrichGO(
+  gene          = significant_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  universe      = universe_symbols,     # <- açık arka plan
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+write.csv(as.data.frame(go_bp), file.path(out_dir,"GO_BP.csv"), row.names = FALSE)
+
+# ------------------ 5) KEGG: (Entrez + universe + BH) ------------------
+kegg <- enrichKEGG(
+  gene          = entrez_sig,
+  universe      = entrez_universe,      # <- açık arka plan
+  organism      = "hsa",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+write.csv(as.data.frame(kegg), file.path(out_dir,"KEGG.csv"), row.names = FALSE)
+
+# ------------------ 6) Görselleştirme (statik, FAIR) ------------------
+# GO Dotplot & Barplot
+if (!is.null(go_bp) && nrow(as.data.frame(go_bp)) > 0) {
+  p_go_dot <- dotplot(go_bp, showCategory = 15, title = "GO Biological Process (BH, universe)") +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(plot_dir,"GO_BP_dotplot.png"), p_go_dot, width = 10, height = 9)
+  ggsave(file.path(plot_dir,"GO_BP_dotplot.pdf"), p_go_dot, width = 10, height = 9)
+
+  p_go_bar <- barplot(go_bp, showCategory = 15, title = "GO Biological Process (BH, universe)") +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(plot_dir,"GO_BP_barplot.png"), p_go_bar, width = 10, height = 9)
+  ggsave(file.path(plot_dir,"GO_BP_barplot.pdf"), p_go_bar, width = 10, height = 9)
+
+  # Benzerlik haritası (emapplot)
+  hsGO <- try(godata('org.Hs.eg.db', ont = "BP"), silent = TRUE)
+  if (!inherits(hsGO, "try-error")) {
+    go_bp_sim <- try(pairwise_termsim(go_bp, semData = hsGO), silent = TRUE)
+    if (!inherits(go_bp_sim, "try-error")) {
+      p_go_emap <- try(emapplot(go_bp_sim, showCategory = 15), silent = TRUE)
+      if (!inherits(p_go_emap, "try-error")) {
+        ggsave(file.path(plot_dir,"GO_BP_emapplot.png"), p_go_emap, width = 10, height = 10)
+        ggsave(file.path(plot_dir,"GO_BP_emapplot.pdf"), p_go_emap, width = 10, height = 10)
+      }
+    }
+  }
+
+  # cnetplot
+  p_go_cnet <- try(cnetplot(go_bp, categorySize = "pvalue", foldChange = NULL, showCategory = 10), silent = TRUE)
+  if (!inherits(p_go_cnet, "try-error")) {
+    ggsave(file.path(plot_dir,"GO_BP_cnetplot.png"), p_go_cnet, width = 12, height = 10)
+    ggsave(file.path(plot_dir,"GO_BP_cnetplot.pdf"), p_go_cnet, width = 12, height = 10)
+  }
+
+  # TOP 15 tablo
+  go_df <- as.data.frame(go_bp)
+  top_go <- head(go_df[order(go_df$p.adjust), ], 15)
+  write.csv(top_go, file.path(out_dir,"GO_BP_top15.csv"), row.names = FALSE)
+}
+
+# KEGG Barplot
+if (!is.null(kegg) && nrow(as.data.frame(kegg)) > 0) {
+  p_kegg <- barplot(kegg, showCategory = 15, title = "KEGG Pathways (BH, universe)") +
+    theme_minimal(base_size = 13)
+  ggsave(file.path(plot_dir,"KEGG_barplot.png"), p_kegg, width = 10, height = 9)
+  ggsave(file.path(plot_dir,"KEGG_barplot.pdf"), p_kegg, width = 10, height = 9)
+
+  # TOP 10 tablo
+  kegg_df <- as.data.frame(kegg)
+  top_kegg <- head(kegg_df[order(kegg_df$p.adjust), ], 10)
+  write.csv(top_kegg, file.path(out_dir,"KEGG_top10.csv"), row.names = FALSE)
+}
+
+# ------------------ 7) GSEA (duyarlılık; eşik bağımlılığını azaltır) ------------------
+# Gene-level logFC listesi (isim = EntrezID, değer = logFC), tüm universe için
+gl <- tt_gene[, c("SYMBOL","logFC")]
+gl <- merge(gl, sym2entrez, by.x = "SYMBOL", by.y = "SYMBOL", all.x = TRUE)
+gl <- gl[!is.na(gl$ENTREZID), c("ENTREZID","logFC")]
+geneList <- gl$logFC; names(geneList) <- gl$ENTREZID
+geneList <- sort(geneList, decreasing = TRUE)
+
+if (length(geneList) >= 20) {
+  gsea_go <- try(gseGO(geneList = geneList, OrgDb = org.Hs.eg.db, ont = "BP",
+                       keyType = "ENTREZID", pAdjustMethod = "BH", verbose = FALSE), silent = TRUE)
+  if (!inherits(gsea_go, "try-error")) {
+    write.csv(as.data.frame(gsea_go), file.path(out_dir,"GSEA_GO_BP.csv"), row.names = FALSE)
+    p_gsea_go <- gseaplot2(gsea_go, geneSetID = head(gsea_go@result$ID, 1), title = "GSEA GO BP (top set)")
+    ggsave(file.path(plot_dir,"GSEA_GO_BP_topset.png"), p_gsea_go, width = 10, height = 6)
+  }
+
+  gsea_kegg <- try(gseKEGG(geneList = geneList, organism = "hsa", pAdjustMethod = "BH", verbose = FALSE), silent = TRUE)
+  if (!inherits(gsea_kegg, "try-error")) {
+    write.csv(as.data.frame(gsea_kegg), file.path(out_dir,"GSEA_KEGG.csv"), row.names = FALSE)
+    p_gsea_kegg <- gseaplot2(gsea_kegg, geneSetID = head(gsea_kegg@result$ID, 1), title = "GSEA KEGG (top pathway)")
+    ggsave(file.path(plot_dir,"GSEA_KEGG_topset.png"), p_gsea_kegg, width = 10, height = 6)
+  }
+}
+
+# ------------------ 8) Kısa özet (makaleye kopyalanabilir) ------------------
+summary_lines <- c(
+  sprintf("GO terms (BH, q<0.05): %d", ifelse(is.null(go_bp), 0, nrow(as.data.frame(go_bp)))),
+  sprintf("KEGG pathways (BH, q<0.05): %d", ifelse(is.null(kegg), 0, nrow(as.data.frame(kegg)))),
+  sprintf("Universe size (SYMBOL): %d | (ENTREZ): %d", length(universe_symbols), length(entrez_universe)),
+  "Notes: Enrichment used BH adjustment and explicit universe (all tested genes at gene-level).",
+  "Sensitivity: Added GSEA (ranked by logFC) to mitigate threshold dependence, important for small-n designs."
+)
+writeLines(summary_lines, file.path(out_dir,"_ENRICHMENT_SUMMARY.txt"))
+# ============================================================================ #
+
+
+
+
+# ==================== miRNA ANALYSIS - FAIR UYUMLU TEK KOD BLOĞU ====================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs <- c("limma","hgu133plus2.db","biomaRt","WebGestaltR","multiMiR",
+          "ggplot2","jsonlite")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    if (p %in% rownames(installed.packages())) next
+    if (p %in% c("limma","hgu133plus2.db","biomaRt","WebGestaltR","multiMiR")) {
+      BiocManager::install(p, ask = FALSE)
+    } else install.packages(p)
+  }
+  library(p, character.only = TRUE)
+}
+
+# ----------------------- Output klasörü -----------------------
+out_dir <- file.path(getwd(), "results", "miRNA_analysis")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ----------------------- Küçük örneklem uyarısı -----------------------
+message("WARNING: Small sample size (n=9 Pompe, n=10 Control). Interpret results cautiously.")
+
+# ----------------------- Model tasarımı -----------------------
+gs <- factor(c(rep("Control", 10), rep("Pompe", 9)), levels = c("Control","Pompe"))
+
+if (exists("batch_vector")) {
+  design_simple <- model.matrix(~ gs + batch_vector)
+} else {
+  design_simple <- model.matrix(~ gs)
+  message("No batch variable provided — potential batch effects not adjusted.")
+}
+
+fit_simple <- lmFit(as.matrix(expr_matrix), design_simple)
+fit_simple <- eBayes(fit_simple)
+
+# ----------------------- DEG (BH-FDR ile) -----------------------
+deg_simple <- topTable(
+  fit_simple, coef = "gsPompe", number = Inf,
+  adjust.method = "BH", p.value = 0.05, lfc = 1
+)
+# Anotasyon
+probe_ids <- rownames(deg_simple)
+anno_df <- select(hgu133plus2.db, keys = probe_ids,
+                  columns = c("SYMBOL","GENENAME"),
+                  keytype = "PROBEID")
+deg_simple$SYMBOL   <- anno_df$SYMBOL[match(probe_ids, anno_df$PROBEID)]
+deg_simple$GENENAME <- anno_df$GENENAME[match(probe_ids, anno_df$PROBEID)]
+
+# FDR < 0.05 olan genler
+sig_genes <- unique(na.omit(deg_simple$SYMBOL[deg_simple$adj.P.Val < 0.05]))
+
+# Kaydet
+write.csv(deg_simple, file.path(out_dir, "DEG_Table_Annotated.csv"), row.names = TRUE)
+
+# ----------------------- WebGestaltR - KEGG -----------------------
+available_dbs <- WebGestaltR::listGeneSet(organism="hsapiens")
+if ("pathway_KEGG" %in% available_dbs$name) {
+  pathway_result <- WebGestaltR(
+    enrichMethod="ORA", organism="hsapiens",
+    enrichDatabase="pathway_KEGG",
+    interestGene=sig_genes,
+    interestGeneType="genesymbol", referenceSet="genome",
+    minNum=5, fdrThr=0.05,
+    isOutput=TRUE, outputDirectory=out_dir,
+    projectName="Pompe_Pathway_Analysis"
+  )
+  write.csv(pathway_result, file.path(out_dir,"WebGestalt_KEGG.csv"), row.names = FALSE)
+}
+
+# ----------------------- multiMiR - miRNA hedefleri -----------------------
+databases <- c("mirtarbase", "mirecords", "tarbase")
+df_list <- list()
+
+for (db in databases) {
+  mm_db <- tryCatch({
+    get_multimir(org = "hsa", target = sig_genes, table = "validated", summary = TRUE)
+  }, error = function(e) return(NULL))
+  
+  if (!is.null(mm_db)) {
+    db_data <- subset(mm_db@data, database == db)
+    if (nrow(db_data) > 0) {
+      db_data$FDR <- p.adjust(db_data$p_value, method = "BH")
+      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
+      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+      df_tmp <- data.frame(
+        miRNA = names(top_mmrs),
+        Target_Count = as.numeric(top_mmrs),
+        Database = db
+      )
+      df_list[[db]] <- df_tmp
+    }
+  }
+}
+
+# ----------------------- Görselleştirme -----------------------
+if (length(df_list) > 0) {
+  df_all <- do.call(rbind, df_list)
+  p <- ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.7) +
+    labs(title = "Top miRNAs by Database (Validated, FDR applied)",
+         x = "miRNA", y = "Number of Validated Targets") +
+    theme_minimal(base_size = 13) +
+    coord_flip()
+  ggsave(file.path(out_dir, "Top_miRNAs_barplot.png"), p, width=8, height=6)
+}
+
+# ----------------------- Meta bilgi -----------------------
+meta <- list(
+  dataset = "GSE38680",
+  n_pompe = 9, n_control = 10,
+  adj_method = "BH",
+  p_cutoff = 0.05, lfc_cutoff = 1,
+  batch_adjusted = exists("batch_vector"),
+  date = Sys.Date()
+)
+jsonlite::write_json(meta, file.path(out_dir, "_analysis_meta.json"), pretty=TRUE)
+
+message("FAIR-compliant miRNA analysis completed. Outputs saved to: ", out_dir)
+
+
+
+
+
+
+# ======================== FAIR-Uyumlu miRNA Analizi ========================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs <- c("multiMiR","ggplot2","dplyr","umap","ggrepel","jsonlite")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    if (p %in% c("multiMiR")) BiocManager::install(p, ask = FALSE)
+    else install.packages(p)
+  }
+  library(p, character.only = TRUE)
+}
+
+# ---- Çıktı klasörü
+out_dir <- file.path(getwd(), "results", "miRNA_analysis")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Meta bilgi: Örneklem ve parametreler
+meta <- list(
+  dataset = "GSE38680",
+  n_pompe = 9, n_control = 10,
+  adj_method = "BH",
+  p_cutoff = 0.05, lfc_cutoff = 1,
+  batch_adjusted = exists("batch_vector"),
+  date = Sys.Date()
+)
+jsonlite::write_json(meta, file.path(out_dir, "_analysis_meta.json"), pretty=TRUE)
+
+# ---- QC: UMAP ile örnek ayrışması
+expr2 <- na.omit(expr_matrix)
+expr2 <- expr2[!duplicated(rownames(expr2)), ]
+ump <- umap(t(expr2), n_neighbors = 8, random_state = 123)
+ump_df <- data.frame(
+  Sample = rownames(ump$layout),
+  UMAP1 = ump$layout[,1],
+  UMAP2 = ump$layout[,2],
+  Group = as.factor(groups)
+)
+p_umap <- ggplot(ump_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(aes(label = Sample), size = 3, max.overlaps = 15) +
+  theme_minimal(base_size = 14) +
+  labs(title = "UMAP QC Plot", x = "UMAP1", y = "UMAP2")
+ggsave(file.path(out_dir, "QC_UMAP.png"), p_umap, width = 7, height = 5)
+
+# ---- multiMiR Analizi (Validated DB'ler)
+sig_genes <- head(significant_genes, 10)  # Örnek amaçlı ilk 10 gen
+mm <- tryCatch({
+  get_multimir(org = "hsa", target = sig_genes,
+               table = "validated", summary = TRUE)
+}, error = function(e) NULL)
+
+if (!is.null(mm)) {
+  db_list <- unique(mm@data$database)
+  df_list <- list()
+  for (db in db_list) {
+    db_data <- subset(mm@data, database == db)
+    if (nrow(db_data) > 0) {
+      db_data$FDR <- p.adjust(db_data$p_value, method = "BH")
+      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
+      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+      df_tmp <- data.frame(
+        miRNA = names(top_mmrs),
+        Target_Count = as.numeric(top_mmrs),
+        Database = db
+      )
+      df_list[[db]] <- df_tmp
+    }
+  }
+  df_all <- bind_rows(df_list)
+  p_val <- ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.7)) +
+    coord_flip() +
+    labs(title = "Validated miRNA Targets (BH-FDR Applied)",
+         x = "miRNA", y = "Target Count") +
+    theme_minimal(base_size = 12)
+  ggsave(file.path(out_dir, "Validated_miRNA_Targets.png"), p_val, width = 8, height = 6)
+}
+
+# ---- multiMiR Analizi (Predicted DB'ler)
+pred_dbs <- c("targetscan","mirdb","miranda","pita")
+df_list_pred <- list()
+for (db in pred_dbs) {
+  mm_pred <- tryCatch({
+    get_multimir(org = "hsa", target = sig_genes,
+                 table = "predicted", summary = TRUE)
+  }, error = function(e) NULL)
+  if (!is.null(mm_pred)) {
+    db_data <- subset(mm_pred@data, database == db)
+    if (nrow(db_data) > 0) {
+      db_data$FDR <- p.adjust(db_data$p_value, method = "BH")
+      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
+      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
+      df_tmp <- data.frame(
+        miRNA = names(top_mmrs),
+        Target_Count = as.numeric(top_mmrs),
+        Database = db
+      )
+      df_list_pred[[db]] <- df_tmp
+    }
+  }
+}
+if (length(df_list_pred) > 0) {
+  df_all_pred <- bind_rows(df_list_pred)
+  p_pred <- ggplot(df_all_pred, aes(x = miRNA, y = Target_Count, fill = Database)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.7)) +
+    coord_flip() +
+    labs(title = "Predicted miRNA Targets (BH-FDR Applied)",
+         x = "miRNA", y = "Target Count") +
+    theme_minimal(base_size = 12)
+  ggsave(file.path(out_dir, "Predicted_miRNA_Targets.png"), p_pred, width = 8, height = 6)
+}
+
+message("FAIR-compliant miRNA analysis completed. Outputs in: ", out_dir)
+
