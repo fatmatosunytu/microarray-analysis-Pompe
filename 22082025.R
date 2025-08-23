@@ -1104,4 +1104,146 @@ writeLines(c(capture.output(sessionInfo())), file.path(out_dir,"session_info.txt
 
 message("miRNA enrichment (FAIR/offline) tamamlandı. Çıktılar: ", out_dir)
 
+# =================== MELAS SENSITIVITY VIS (opsiyonel; FAIR) ===================
+
+has_melas <- "is_melas" %in% names(pheno_aligned) && any(pheno_aligned$is_melas)
+if (has_melas) {
+  keep_idx <- which(!pheno_aligned$is_melas)
+  if (length(keep_idx) >= 4) {  # küçük n koruması
+    expr_sens <- expr_use[, keep_idx, drop = FALSE]
+    ph_sens   <- droplevels(pheno_aligned[keep_idx, ])
+    des_s     <- model.matrix(~0 + group, data = ph_sens)
+    colnames(des_s) <- levels(ph_sens$group)
+
+    fit_s  <- limma::lmFit(expr_sens, des_s)
+    cont_s <- limma::makeContrasts(Pompe - Control, levels = des_s)
+    fit_s2 <- limma::eBayes(limma::contrasts.fit(fit_s, cont_s))
+
+    tt_all_s <- limma::topTable(fit_s2, coef = 1, number = Inf, adjust.method = "BH")
+    # gene-level’e indir
+    stopifnot("SYMBOL" %in% names(tt_all)) # ana tabloda anotasyon vardı
+    ann_s <- AnnotationDbi::select(hgu133plus2.db,
+                                   keys = rownames(tt_all_s),
+                                   columns = c("SYMBOL"),
+                                   keytype = "PROBEID")
+    tt_all_s$SYMBOL <- ann_s$SYMBOL[match(rownames(tt_all_s), ann_s$PROBEID)]
+    tt_all_s$abs_logFC <- abs(tt_all_s$logFC)
+    tt_gene_s <- tt_all_s[!is.na(tt_all_s$SYMBOL) & nzchar(tt_all_s$SYMBOL), ]
+    tt_gene_s <- tt_gene_s[order(tt_gene_s$SYMBOL, -tt_gene_s$abs_logFC), ]
+    tt_gene_s <- tt_gene_s[!duplicated(tt_gene_s$SYMBOL), ]
+    deg_sens  <- subset(tt_gene_s, adj.P.Val < 0.05)
+
+    # Volcano (no‑MELAS)
+    volc_sens <- ggplot(tt_gene_s, aes(logFC, -log10(adj.P.Val))) +
+      geom_point(aes(color = adj.P.Val < 0.05), alpha = 0.75, size = 1.6) +
+      geom_vline(xintercept = c(-1, 1), lty = "dashed", color = "grey50") +
+      geom_hline(yintercept = -log10(0.05), lty = "dashed", color = "grey50") +
+      scale_color_manual(values = c("grey70","steelblue")) +
+      labs(title = "Volcano (No‑MELAS; BH‑FDR; gene‑level)",
+           x = expression(log[2]*"FC"), y = expression(-log[10]*"FDR"), color = NULL) +
+      theme_bw(base_size = 12)
+
+    ggsave(file.path(plots_dir, "volcano_FDR_geneLevel_noMELAS.png"),
+           volc_sens, width = 8, height = 6, dpi = 300)
+
+    # Kesişim özeti
+    ov   <- length(intersect(deg$SYMBOL, deg_sens$SYMBOL))
+    msg  <- sprintf("MELAS dahil DEG: %d | MELAS hariç DEG: %d | ortak: %d",
+                    nrow(deg), nrow(deg_sens), ov)
+    writeLines(msg, file.path(root,"results","deg","MELAS_sensitivity_summary.txt"))
+    message("[MELAS] ", msg)
+  } else {
+    message("[MELAS] Hariç sonrası örnek sayısı çok az; duyarlılık görselleri atlandı.")
+  }
+}
+
+# ====================== miRNA VIS (multiMiR; FAIR; ayrı DB'ler) ======================
+
+if (!requireNamespace("multiMiR", quietly = TRUE)) BiocManager::install("multiMiR")
+for (p in c("multiMiR","ggplot2","dplyr","ggrepel","jsonlite","umap")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+mir_dir <- file.path(root, "results", "miRNA_analysis")
+dir.create(mir_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Küçük n hatırlatması
+writeLines("WARNING: small sample size (9 Pompe vs 10 Control). Interpret with caution.",
+           file.path(mir_dir, "_NOTE_small_n.txt"))
+
+# Hedef gen listesi: ana DEG (gene-level; FDR<0.05) sembollerinden ilk 50 (varsa)
+sig_syms <- if (exists("deg")) head(unique(deg$SYMBOL), 50) else character(0)
+if (length(sig_syms) < 2) {
+  message("[miRNA] Yeterli anlamlı gen yok; multiMiR adımları atlandı.")
+} else {
+  # VALIDATED
+  mm_valid <- tryCatch(
+    multiMiR::get_multimir(org="hsa", target=sig_syms, table="validated", summary=TRUE),
+    error = function(e) NULL
+  )
+  if (!is.null(mm_valid) && nrow(mm_valid@data) > 0) {
+    dfv <- mm_valid@data
+    dfv$FDR <- p.adjust(dfv$p_value, method = "BH")
+    # Her veritabanı için en yoğun 10 miRNA
+    pltv <- dfv |>
+      dplyr::count(database, mature_mirna_id, name="Target_Count") |>
+      dplyr::group_by(database) |>
+      dplyr::slice_max(Target_Count, n = 10, with_ties = FALSE) |>
+      dplyr::ungroup()
+
+    p_val <- ggplot(pltv, aes(x = mature_mirna_id, y = Target_Count, fill = database)) +
+      geom_bar(stat="identity", position = position_dodge(width=.7), width=.6) +
+      coord_flip() + theme_minimal(base_size = 12) +
+      labs(title="Validated miRNA Targets (multiMiR; BH‑FDR applied)",
+           x="miRNA", y="Target count", fill="DB")
+    ggsave(file.path(mir_dir, "Validated_miRNA_targets.png"), p_val, width=8, height=6, dpi=300)
+    write.csv(dfv, file.path(mir_dir, "validated_full_with_FDR.csv"), row.names = FALSE)
+  } else {
+    message("[miRNA] Validated sonuç yok ya da erişilemedi.")
+  }
+
+  # PREDICTED
+  mm_pred <- tryCatch(
+    multiMiR::get_multimir(org="hsa", target=sig_syms, table="predicted", summary=TRUE),
+    error = function(e) NULL
+  )
+  if (!is.null(mm_pred) && nrow(mm_pred@data) > 0) {
+    dfp <- mm_pred@data
+    dfp$FDR <- p.adjust(dfp$p_value, method = "BH")
+    pltp <- dfp |>
+      dplyr::count(database, mature_mirna_id, name="Target_Count") |>
+      dplyr::group_by(database) |>
+      dplyr::slice_max(Target_Count, n = 10, with_ties = FALSE) |>
+      dplyr::ungroup()
+
+    p_pred <- ggplot(pltp, aes(x = mature_mirna_id, y = Target_Count, fill = database)) +
+      geom_bar(stat="identity", position=position_dodge(width=.7), width=.6) +
+      coord_flip() + theme_minimal(base_size = 12) +
+      labs(title="Predicted miRNA Targets (multiMiR; BH‑FDR applied)",
+           x="miRNA", y="Target count", fill="DB")
+    ggsave(file.path(mir_dir, "Predicted_miRNA_targets.png"), p_pred, width=8, height=6, dpi=300)
+    write.csv(dfp, file.path(mir_dir, "predicted_full_with_FDR.csv"), row.names = FALSE)
+  } else {
+    message("[miRNA] Predicted sonuç yok ya da erişilemedi.")
+  }
+}
+
+# UMAP QC (mikroarray ifadeden)
+expr2 <- na.omit(expr_use)
+expr2 <- expr2[!duplicated(rownames(expr2)), ]
+set.seed(123)
+um <- umap::umap(t(expr2), n_neighbors = 8, random_state = 123)
+ump_df <- data.frame(Sample = rownames(um$layout),
+                     UMAP1 = um$layout[,1], UMAP2 = um$layout[,2],
+                     Group = groups)
+p_umap <- ggplot(ump_df, aes(UMAP1, UMAP2, color = Group, label = Sample)) +
+  geom_point(size=3) + ggrepel::geom_text_repel(size=3, max.overlaps = 15) +
+  theme_minimal(base_size = 13) + labs(title="UMAP QC (batch/SVA sonrası ifade)")
+ggsave(file.path(mir_dir, "QC_UMAP.png"), p_umap, width=7, height=5, dpi=300)
+
+# Meta JSON
+meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
+                 n_control=sum(groups=="Control"), adj="BH",
+                 note_small_n=TRUE, date=as.character(Sys.Date()))
+jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
 
