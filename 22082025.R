@@ -748,3 +748,16 @@ if (exists("tt_gene_s")) {
   }
 }
 
+if (!requireNamespace("gridExtra", quietly = TRUE)) install.packages("gridExtra")
+library(gridExtra); library(grid)
+
+if (exists("ph")) {
+  pdf(file.path(root,"results","plots","volcano_heatmap_Fig1.pdf"), width=16, height=8, family="Times")
+  grid.arrange(
+    arrangeGrob(volc, top = textGrob("A", gp=gpar(fontsize=22, fontface="bold"), x=unit(0,"npc"), hjust=0)),
+    arrangeGrob(ph$gtable, top = textGrob("B", gp=gpar(fontsize=22, fontface="bold"), x=unit(0,"npc"), hjust=0)),
+    ncol = 2
+  )
+  dev.off()
+}
+
