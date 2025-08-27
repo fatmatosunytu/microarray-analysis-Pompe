@@ -7,859 +7,1098 @@
 # License: MIT
 # =============================================================================
 
-# ---------------------------LOAD AND INSTALL REQUIRED PACKAGES-----------------
+#========================== Install and load required packages for analysis ===================================
 
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-BiocManager::install(c("affy", "limma", "Biobase", "hgu133plus2.db"), ask = FALSE)
+packages <- c(
+  "pkgbuild", "AnnotationDbi", "Biobase", "DOSE", "GEOquery", "GOSemSim", "R.utils",
+  "affy", "annotate", "clusterProfiler", "data.table", "dplyr", "enrichplot",
+  "genefilter", "ggplot2", "ggrepel", "grid", "gridExtra", "hgu133plus2.db",
+  "jsonlite", "limma", "msigdbr", "multiMiR", "org.Hs.eg.db", "pheatmap",
+  "sva", "umap"
+)
 
-library(affy)
-library(limma)
-library(Biobase)
-library(hgu133plus2.db)
+#------------------------   Load required packages; assumes they are already installed   ----------------------
 
-# 1. Set the working directory and read the CEL files
-setwd("C:/Users/User/Desktop/dataset")
-gset <- ReadAffy()
-gset <- rma(gset)  # Normalize et
+invisible(lapply(packages, library, character.only = TRUE))
 
-# 2. Extract the normalized expression matrix
-expr_matrix <- exprs(gset)
+  align_samples <- function(cel_files, pheno) {
+   sample_names <- basename(cel_files)
+   pheno_df <- as.data.frame(pheno, stringsAsFactors = FALSE)
+   pheno_keys <- toupper(basename(trimws(pheno_df$filename)))
+   sample_keys <- toupper(sample_names)
+   idx <- match(sample_keys, pheno_keys)
+   if (any(is.na(idx))) {
+     stop("pheno$filename içinde bulunamayan örnek(ler): ",
+         paste(sample_names[is.na(idx)], collapse = ", "))
+   }
+   aligned <- pheno_df[idx, , drop = FALSE]
+   rownames(aligned) <- sample_names
+   stopifnot(nrow(aligned) == length(sample_names))
+   stopifnot(identical(rownames(aligned), sample_names))
+   aligned
+ }
 
-# RMA outputs are generally not needed, but if you want to add them:
-if(any(is.na(expr_matrix))) {
-  expr_matrix[is.na(expr_matrix)] <- rowMeans(expr_matrix, na.rm = TRUE)[row(expr_matrix)[is.na(expr_matrix)]]
+pkgbuild::has_build_tools(debug = TRUE)
+
+args <- commandArgs(trailingOnly = TRUE)
+FDR_THRESH   <- if (length(args) >= 1) as.numeric(args[1]) else 0.1
+LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
+
+#-----------------------------   Load CEL files and normalize with RMA    ---------------------------------------------
+
+  root_dir <- normalizePath(Sys.getenv("POMPE_ROOT", getwd()), winslash = "/")
+  dir.create(file.path(root_dir, "metadata"), showWarnings = FALSE, recursive = TRUE)
+  meta_dir <- file.path(root_dir, "metadata")
+
+  stopifnot(dir.exists(meta_dir))
+
+  dir.create(file.path(root_dir, "results", "qc"),    recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(root_dir, "results", "deg"),   recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(root_dir, "results", "plots"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(root_dir, "results", "miRNA_analysis"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(root_dir, "logs"),             recursive = TRUE, showWarnings = FALSE)
+
+  writeLines(c(capture.output(sessionInfo())), file.path(root_dir, "logs", "session_info.txt"))
+
+  set.seed(20240724)
+
+  pheno <- data.table::fread(file.path(meta_dir, "pheno.csv"), na.strings = c("", "NA", "NaN"))
+
+pheno$filename <- basename(trimws(pheno$filename))
+cel_dir   <- meta_dir
+cel_files <- file.path(cel_dir, pheno$filename)
+missing   <- pheno$filename[!file.exists(cel_files)]
+if (length(missing)) stop("Missing CEL files in metadata/: ", paste(missing, collapse = ", "))
+
+stopifnot(all(c("sample","group","filename") %in% names(pheno)))
+g <- tolower(trimws(as.character(pheno$group)))
+g[g %in% c("control","healthy","normal")] <- "control"
+g[grepl("pompe", g)] <- "pompe"
+pheno$group <- factor(ifelse(g %in% c("control","pompe"),
+                             ifelse(g == "control","Control","Pompe"), NA_character_),
+                      levels = c("Control","Pompe"))
+stopifnot(!any(is.na(pheno$group)))
+
+if (!"is_melas" %in% names(pheno)) pheno$is_melas <- FALSE
+pheno$is_melas <- tolower(trimws(as.character(pheno$is_melas))) %in%
+  c("1","true","t","yes","y")
+
+if (!"batch" %in% names(pheno)) pheno$batch <- NA
+
+# ----------------   ExpressionSet ID eşitleme (assayData / phenoData / protocolData)   -----------------------
+
+pheno_aligned <- align_samples(cel_files, pheno)
+if (inherits(pheno_aligned, "data.table")) data.table::setDF(pheno_aligned)
+
+if (anyDuplicated(rownames(pheno_aligned))) {
+  rownames(pheno_aligned) <- make.unique(rownames(pheno_aligned))
 }
-if(any(is.infinite(expr_matrix))) {
-  expr_matrix[is.infinite(expr_matrix)] <- quantile(expr_matrix, 0.99, na.rm = TRUE)
+
+if (!exists("eset")) {
+  stopifnot(exists("cel_files"))
+  raw  <- ReadAffy(filenames = cel_files)
+  eset <- rma(raw)
+  expr <- exprs(eset)
 }
 
-# Get the sample names (column names)
-colnames_ex <- colnames(expr_matrix)
+Biobase::sampleNames(eset) <- rownames(pheno_aligned)
 
-# Extract GSM IDs (example: GSM947461_H0013501 → GSM947461)
-colnames_ex_gsm <- sapply(strsplit(colnames_ex, "_"), `[`, 1)
+expr <- Biobase::exprs(eset)                 
+colnames(expr) <- Biobase::sampleNames(eset) 
 
-# Group definitions
-control_gsm <- c("GSM947461", "GSM947462", "GSM947463", "GSM947464", "GSM947465", 
-                 "GSM947466", "GSM947467", "GSM947468", "GSM947469", "GSM947470")
-pompe_gsm <- c("GSM947471", "GSM947472", "GSM947473", "GSM947474", "GSM947475", 
-               "GSM947476", "GSM947477", "GSM947478", "GSM947479")
+ord <- match(Biobase::sampleNames(eset), rownames(pheno_aligned))
+stopifnot(!any(is.na(ord)))                
+pheno_aligned <- pheno_aligned[ord, , drop = FALSE]
 
-# Create the group vector
-groups <- ifelse(colnames_ex_gsm %in% control_gsm, "Control",
-                 ifelse(colnames_ex_gsm %in% pompe_gsm, "Pompe", NA))
+Biobase::pData(eset) <- pheno_aligned
+Biobase::protocolData(eset) <- Biobase::AnnotatedDataFrame(
+  data.frame(row.names = Biobase::sampleNames(eset))
+)
 
-# Check for mismatches
-if (any(is.na(groups))) {
-  stop("Unmatched samples: ", paste(colnames_ex[is.na(groups)], collapse = ", "))
+methods::validObject(eset)  # TRUE dönmeli
+expr_matrix <- Biobase::exprs(eset)
+colnames(expr_matrix) <- Biobase::sampleNames(eset)
+
+#========================== Conduct quality control and filter low-expression probes ===================================
+
+  iqr <- apply(expr, 1, IQR)
+thr <- quantile(iqr, 0.20, na.rm = TRUE)   # alt %20 IQR dışarı
+keep <- iqr > thr
+expr_f <- expr[keep, ]
+message("Low-expression removed: ", sum(!keep), " probes (", round(mean(!keep)*100,2), "%)")
+write.csv(data.frame(probe=rownames(expr)[!keep], IQR=iqr[!keep]),
+          file.path(root_dir,"results","qc","low_expression_removed.csv"), row.names = FALSE)
+
+pca <- prcomp(t(expr_f), scale. = TRUE)
+pca_df <- data.frame(pca$x[,1:2], group = pheno_aligned$group,
+                     batch = pheno_aligned$batch, sample = pheno_aligned$sample)
+gg <- ggplot(pca_df, aes(PC1, PC2, color = group, shape = factor(batch), label = sample)) +
+  geom_point(size=3) + ggrepel::geom_text_repel(size=2.8) +
+  theme_bw(14) + labs(title="PCA – RMA + IQR filtre", shape = "batch")
+ggplot2::ggsave(file.path(root_dir,"results","qc","pca_groups_batches.png"), gg, width=9, height=7)
+
+#========================== Identify differentially expressed genes with limma ===================================
+
+expr_cb <- if (exists("expr_f")) expr_f else expr   
+stopifnot(is.matrix(expr_cb))
+stopifnot(exists("design"))
+stopifnot(ncol(expr_cb) == nrow(design))           
+
+expr_cb <- if (exists("expr_f")) expr_f else expr  
+stopifnot(exists("pheno_aligned"))
+groups <- factor(pheno_aligned$group, levels = c("Control","Pompe"))
+
+design <- model.matrix(~ 0 + groups)
+colnames(design) <- c("Control","Pompe")
+
+stopifnot(is.matrix(expr_cb))
+stopifnot(is.matrix(design))
+stopifnot(ncol(expr_cb) == nrow(design))
+
+print(dim(expr_cb)); print(dim(design)); head(design)
+
+age_m <- sex_f <- rin_n <- NULL
+
+if ("age_at_baseline_mounth" %in% names(pheno_aligned) ||
+    "age_at_baseline_month"  %in% names(pheno_aligned)) {
+  age_col <- intersect(c("age_at_baseline_mounth","age_at_baseline_month"),
+                       names(pheno_aligned))[1]
+  age_m <- suppressWarnings(as.numeric(gsub(",", ".", trimws(pheno_aligned[[age_col]]))))
 }
 
-# Define as a factor
-groups <- factor(groups, levels = c("Control", "Pompe"))
-
-# Check the distribution
-table(groups)
-
-#----------------------------- ANALYSIS PREPARATION ----------------------------
-
-# 1. Get and clean sample names
-sample_names <- colnames(expr_matrix)
-sample_names <- gsub("\\.CEL$", "", sample_names)
-
-# 2. Define group information (required for analysis)
-control_samples <- c("GSM947461_H0013501", "GSM947462_H0013502", "GSM947463_H0013504", 
-                     "GSM947464_H0013505", "GSM947465_H0013506", "GSM947466_H0013507", 
-                     "GSM947467_H0013508", "GSM947468_H0013509", "GSM947469_H0013510", 
-                     "GSM947470_H0013503")
-pompe_samples <- c("GSM947471_H0013492", "GSM947472_H0013493", "GSM947473_H0013494", 
-                   "GSM947474_H0013495", "GSM947475_H0013496", "GSM947476_H0013497", 
-                   "GSM947477_H0013498", "GSM947478_H0013499", "GSM947479_H0013500")
-
-groups <- ifelse(sample_names %in% control_samples, "Control",
-                 ifelse(sample_names %in% pompe_samples, "Pompe", NA))
-
-# 3. Check for missing matches
-if(any(is.na(groups))) {
-  stop("Eşleşmeyen örnekler bulundu: ", paste(sample_names[is.na(groups)], collapse = ", "))
+if ("sex" %in% names(pheno_aligned)) {
+  sex_f <- factor(toupper(trimws(as.character(pheno_aligned$sex))))
 }
 
-groups <- factor(groups, levels = c("Control", "Pompe"))
+if ("rin" %in% names(pheno_aligned)) {
+  rin_raw <- trimws(as.character(pheno_aligned$rin))
+  rin_raw[rin_raw %in% c("TRUE","T","Yes","Y")] <- NA  # sayı olmayanları NA yap
+  rin_n <- suppressWarnings(as.numeric(gsub(",", ".", rin_raw)))
+}
 
-# 4. Design matrix and model
-design <- model.matrix(~0 + groups)
-colnames(design) <- levels(groups)
+design_df <- data.frame(groups = factor(pheno_aligned$group, levels=c("Control","Pompe")),
+                        stringsAsFactors = FALSE)
 
-fit <- lmFit(expr_matrix, design)
-contrast.matrix <- makeContrasts(Pompe - Control, levels = design)
-fit2 <- contrasts.fit(fit, contrast.matrix)
-fit2 <- eBayes(fit2)
+if (!is.null(age_m)) {
+  sda <- stats::sd(age_m, na.rm = TRUE)
+  if (!is.na(sda) && sda > 0) design_df$age_m <- age_m
+}
 
-# 5. Get DEG results
-deg_results <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH", p.value = 0.05, lfc = 1)
+if (!is.null(sex_f)) {
+  sex_f <- droplevels(sex_f)
+  if (nlevels(sex_f) >= 2) design_df$sex_f <- sex_f
+}
 
-# -----------------------------------DEG RESULTS--------------------------------
+if (!is.null(rin_n)) {
+  sdr <- stats::sd(rin_n, na.rm = TRUE)
+  if (!is.na(sdr) && sdr > 0) design_df$rin_n <- rin_n
+}
 
-# 1. Install relevant packages
-BiocManager::install(c("hgu133plus2.db", "biomaRt", "clusterProfiler", "org.Hs.eg.db", "enrichplot"))
-install.packages("pheatmap")
-library(hgu133plus2.db)
-library(biomaRt)
-library(clusterProfiler)
-library(org.Hs.eg.db)
-library(enrichplot)
-library(pheatmap)
+design_cov <- stats::model.matrix(~ 0 + ., data = design_df)
+colnames(design_cov) <- sub("^groupsControl$", "Control",
+                            sub("^groupsPompe$",   "Pompe", colnames(design_cov)))
+rownames(design_cov) <- rownames(pheno_aligned)
+
+  fit  <- limma::lmFit(expr_cb, design)
+cont <- limma::makeContrasts(PompeVsControl = Pompe - Control, levels = design)
+fit2 <- limma::eBayes(limma::contrasts.fit(fit, cont))
+
+tt_all <- limma::topTable(fit2, coef = "PompeVsControl", number = Inf, adjust.method = "BH")
+
+probes <- rownames(expr_cb)
+ann <- AnnotationDbi::select(hgu133plus2.db, keys = probes,
+                             columns = c("SYMBOL","GENENAME"),
+                             keytype = "PROBEID")
+
+#sym    <- ann$SYMBOL[match(probes, ann$PROBEID)]
+#genenm <- ann$GENENAME[match(probes, ann$PROBEID)]
+
+#tt_all$SYMBOL   <- sym[rownames(tt_all)]
+#tt_all$GENENAME <- genenm[rownames(tt_all)]
 
 
-# 2. Annotation via biomaRt
-View(deg_results)
-probe_ids <- rownames(deg_results)
+ann <- AnnotationDbi::select(hgu133plus2.db,
+                             keys = rownames(tt_all),
+                             columns = c("SYMBOL","GENENAME"),
+                             keytype = "PROBEID")
 
-tryCatch({
-  mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
-  gene_symbols <- getBM(attributes = c("affy_hg_u133_plus_2", "hgnc_symbol"),
-                        filters = "affy_hg_u133_plus_2",
-                        values = probe_ids,
-                        mart = mart)
+lkp_sym  <- setNames(ann$SYMBOL,  ann$PROBEID)
+lkp_name <- setNames(ann$GENENAME, ann$PROBEID)
+
+tt_all$SYMBOL   <- unname(lkp_sym[rownames(tt_all)])
+tt_all$GENENAME <- unname(lkp_name[rownames(tt_all)])
+
+
+tt_all$abs_logFC <- abs(tt_all$logFC)
+tt_gene <- tt_all[!is.na(tt_all$SYMBOL) & nzchar(tt_all$SYMBOL), ]
+tt_gene <- tt_gene[order(tt_gene$SYMBOL, -tt_gene$abs_logFC), ]
+tt_gene <- tt_gene[!duplicated(tt_gene$SYMBOL), ]
+
+stopifnot(exists("tt_all"))
+
+table(is.na(tt_all$SYMBOL))   # artık çoğu FALSE olmalı
+nrow(tt_gene)                 # >0 olmalı
+
+deg <- subset(tt_gene, adj.P.Val < FDR_THRESH & abs(logFC) >= LOGFC_THRESH)
+if (nrow(deg) == 0) stop("No significant DEGs; lower thresholds or check design.")
+
+up_n   <- sum(deg$logFC > 0, na.rm = TRUE)
+down_n <- sum(deg$logFC < 0, na.rm = TRUE)
+
+write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
+write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
+write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
+
+nrow(tt_all)
+table("SYMBOL_is_NA" = is.na(tt_all$SYMBOL))
+mean(!is.na(tt_all$SYMBOL))  # kapsama oranı
+probes <- rownames(expr_cb)
+all(rownames(tt_all) %in% probes)
+
+head(AnnotationDbi::select(hgu133plus2.db,
+                           keys=head(probes, 5),
+                           columns=c("SYMBOL","GENENAME"),
+                           keytype="PROBEID"))
+
+
+cat("\n=== ÖZET ===\n")
+cat("Design boyutu: ", nrow(design), " örnek x ", ncol(design), " değişken\n", sep = "")
+cat("Toplam gen (probe-level): ", nrow(tt_all), "\n", sep = "")
+cat("Tekilleştirilmiş gen sayısı: ", nrow(tt_gene), "\n", sep = "")
+write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
+cat("İlk 5 DEG:\n"); print(utils::head(deg[, c("SYMBOL","logFC","adj.P.Val","GENENAME")], 5))
+
+de_sig <- deg             # FDR < FDR_THRESH gene-level
+expr_use <- expr_cb       # batch/SVA sonrası matris (grafikler için)
+
+if (!exists("deg")) {
+  p_thresh   <- get0("p_thresh",   ifnotfound = get0("FDR_THRESH",   ifnotfound = 0.1))
+  lfc_thresh <- get0("lfc_thresh", ifnotfound = get0("LOGFC_THRESH", ifnotfound = 0.5))
+  stopifnot(exists("tt_gene"))
+  deg <- subset(tt_gene, adj.P.Val < p_thresh & abs(logFC) >= lfc_thresh)
+}
+total_deg <- nrow(deg)
+up_deg    <- sum(deg$logFC > 0, na.rm = TRUE)
+down_deg  <- sum(deg$logFC < 0, na.rm = TRUE)
+cat("Toplam DEG:", total_deg, "| Up:", up_deg, "| Down:", down_deg, "\n")
+
+to_scalar_logical <- function(x) {
+  if (is.logical(x)) return(isTRUE(any(x, na.rm = TRUE)))
+  if (is.numeric(x)) return(isTRUE(any(x != 0, na.rm = TRUE)))
+  if (is.character(x)) {
+    y <- tolower(trimws(x))
+    return(isTRUE(any(y %in% c("1","true","t","yes","y"), na.rm = TRUE)))
+  }
+  FALSE
+}
+
+prepare_melas <- function(pheno, expr, results_dir = file.path(getwd(), "results")) {
+  ids <- colnames(expr)
+  if (!"filename" %in% names(pheno))
+    stop("pheno_aligned içinde 'filename' kolonu yok (GSM...CEL).")
   
-  deg_results$Gene.Symbol <- gene_symbols$hgnc_symbol[match(probe_ids, gene_symbols$affy_hg_u133_plus_2)]
+  idx <- match(ids, pheno$filename)
+  stopifnot(!any(is.na(idx)))
+  pheno <- pheno[idx, , drop = FALSE]
+  rownames(pheno) <- ids
   
-  write.csv(deg_results, "Pompe_vs_Control_Meaningful_Genes_With_Symbols.csv")
-  cat("Gene symbols added successfully.\n")
-}, error = function(e) {
-  cat("BiomaRt connection error:", e$message, "\n")
+  run_res <- run_deg_analysis(expr, pheno, run_melas = TRUE)
+  deg_cov    <- run_res$deg_cov
+  deg_cov_sig <- run_res$deg_cov_sig
+  deg_noM    <- run_res$deg_noM
+  deg_noM_sig <- run_res$deg_noM_sig
+  
+  dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+  write.csv(deg_cov,  file.path(results_dir, "DE_all_covariate_MELAS_included.csv"))
+  write.csv(deg_noM,  file.path(results_dir, "DE_all_noMELAS.csv"))
+  write.csv(deg_cov_sig, file.path(results_dir,
+                                   sprintf("DE_sig_covariate_MELAS_included_FDR%s_LFC%s.csv",
+                                           FDR_THRESH, LOGFC_THRESH)))
+  write.csv(deg_noM_sig, file.path(results_dir,
+                                   sprintf("DE_sig_noMELAS_FDR%s_LFC%s.csv",
+                                           FDR_THRESH, LOGFC_THRESH)))
+  
+  list(pheno_aligned = pheno,
+       deg_cov = deg_cov, deg_cov_sig = deg_cov_sig,
+       deg_noM = deg_noM, deg_noM_sig = deg_noM_sig)
+}
+
+melas_flag <-
+  ( "is_melas" %in% names(pheno_aligned) && to_scalar_logical(pheno_aligned$is_melas) ) ||
+  ( "specialcase" %in% names(pheno_aligned) && to_scalar_logical(pheno_aligned$specialcase) )
+
+
+melas_flag <-
+  ( "is_melas" %in% names(pheno_aligned) &&
+      isTRUE(any(tolower(trimws(as.character(pheno_aligned$is_melas))) %in% c("1","true","t","yes","y"), na.rm = TRUE)) ) ||
+  ( "specialcase" %in% names(pheno_aligned) &&
+      isTRUE(any(as.logical(pheno_aligned$specialcase), na.rm = TRUE)) )
+
+pheno_aligned$is_melas <- factor(ifelse(melas_flag, "Yes","No"), levels = c("No","Yes"))
+
+pheno_aligned$group <- factor(pheno_aligned$group, levels = c("Control","Pompe"))
+if ("age_at_baseline_mounth" %in% names(pheno_aligned))
+  pheno_aligned$age_at_baseline_mounth <- suppressWarnings(as.numeric(pheno_aligned$age_at_baseline_mounth))
+if ("sex" %in% names(pheno_aligned))
+  pheno_aligned$sex <- factor(pheno_aligned$sex)  # "M"/"F"
+if ("rin" %in% names(pheno_aligned))
+  pheno_aligned$rin <- suppressWarnings(as.numeric(pheno_aligned$rin))
+
+stopifnot(nrow(pheno_aligned) == ncol(expr_f))
+stopifnot(identical(rownames(pheno_aligned), colnames(expr_f)))
+
+run_deg_analysis <- function(expr, pheno, run_melas = FALSE,
+                             lfc_threshold = LOGFC_THRESH, fdr_threshold = FDR_THRESH) {
+  design_cov <- model.matrix(~0 + group + is_melas + age_at_baseline_mounth + sex + rin,
+                             data = pheno)
+  colnames(design_cov) <- make.names(colnames(design_cov))
+  fit_cov  <- limma::lmFit(expr, design_cov)
+  cont_cov <- limma::makeContrasts(Pompe - Control, levels = design_cov)
+  fit2_cov <- limma::eBayes(limma::contrasts.fit(fit_cov, cont_cov))
+  cov_res  <- limma::topTable(fit2_cov, coef = 1, number = Inf, adjust.method = "BH")
+  out <- list(deg_cov = cov_res,
+              deg_cov_sig = subset(cov_res, adj.P.Val < fdr_threshold & abs(logFC) >= lfc_threshold))
+  if (run_melas) {
+    keep_idx <- which(pheno$is_melas == "No")
+    expr_noM <- expr[, keep_idx, drop = FALSE]
+    ph_noM   <- droplevels(pheno[keep_idx, ])
+    ph_noM$group <- factor(ph_noM$group, levels = c("Control","Pompe"))
+    design_noM <- model.matrix(~0 + group + age_at_baseline_mounth + sex + rin, data = ph_noM)
+    colnames(design_noM) <- make.names(colnames(design_noM))
+    fit_noM  <- limma::lmFit(expr_noM, design_noM)
+    cont_noM <- limma::makeContrasts(Pompe - Control, levels = design_noM)
+    fit2_noM <- limma::eBayes(limma::contrasts.fit(fit_noM, cont_noM))
+    deg_noM    <- limma::topTable(fit2_noM, coef = 1, number = Inf, adjust.method = "BH")
+    out$deg_noM <- deg_noM
+    out$deg_noM_sig <- subset(deg_noM, adj.P.Val < fdr_threshold & abs(logFC) >= lfc_threshold)
+  }
+  out
+}
+
+plot_dir <- file.path(root_dir, "results", "plots")
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f
+stopifnot(ncol(expr_plot) == nrow(pheno_aligned))
+
+stopifnot(exists("tt_all"), exists("tt_gene"), exists("deg"))
+
+volc_main <- within(tt_all, {
+  negLog10FDR <- -log10(adj.P.Val)
+  sig <- adj.P.Val < FDR_THRESH
+  dir <- ifelse(sig & logFC > 0, "Up",
+                ifelse(sig & logFC < 0, "Down", "NS"))
 })
 
-# 3. Save and display results
-write.csv(deg_results, "Pompe_vs_Control_limma_DEGs_with_genes.csv", row.names = TRUE)
-View(deg_results)
+lab_main <- head(volc_main[order(volc_main$adj.P.Val, -abs(volc_main$logFC)), ], 15)
+lab_main$SYMBOL[is.na(lab_main$SYMBOL) | lab_main$SYMBOL == ""] <- rownames(lab_main)[is.na(lab_main$SYMBOL) | lab_main$SYMBOL == ""]
 
-# 4. Statistical summary
-de_summary <- summary(decideTests(fit2, adjust.method = "BH", p.value = 0.05, lfc = 1))
-print(de_summary)
-
-# -----------------------------------VOLCANO PLOT (WITH GENE NAME)--------------
-
-# Add symbol to deg_results_all
-deg_results_all <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH")
-probe_ids_all <- rownames(deg_results_all)
-
-library(biomaRt)
-mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
-gene_symbols_all <- getBM(attributes = c("affy_hg_u133_plus_2", "hgnc_symbol"),
-                          filters = "affy_hg_u133_plus_2",
-                          values = probe_ids_all,
-                          mart = mart)
-deg_results_all$Gene.Symbol <- gene_symbols_all$hgnc_symbol[match(probe_ids_all, gene_symbols_all$affy_hg_u133_plus_2)]
-
-library(ggplot2)
-library(ggrepel)
-
-# Color vector
-colors <- c("NS" = "gray", 
-            "log2 FC" = "skyblue", 
-            "p-value" = "red", 
-            "p-value and log2 FC" = "blue")
-
-# Select the 20 most significant genes and remove the ones with empty/no gene symbols
-top_genes <- deg_results_all[order(deg_results_all$adj.P.Val), ][1:20, ]
-top_genes <- top_genes[!is.na(top_genes$Gene.Symbol) & top_genes$Gene.Symbol != "", ]
-
-deg_results_all$category <- "NS"
-deg_results_all$category[deg_results_all$adj.P.Val < 0.05 & abs(deg_results_all$logFC) > 1] <- "p-value and log2 FC"
-deg_results_all$category[deg_results_all$adj.P.Val < 0.05 & abs(deg_results_all$logFC) <= 1] <- "p-value"
-deg_results_all$category[deg_results_all$adj.P.Val >= 0.05 & abs(deg_results_all$logFC) > 1] <- "log2 FC"
-
-# ggplot code
-volcano_plot <- ggplot(deg_results_all, aes(x = logFC, y = -log10(P.Value), color = category)) +
-  geom_point(alpha = 0.7, size = 2) +
-  geom_text_repel(
-    data = top_genes,
-    aes(label = Gene.Symbol),
-    color="black",
-    size = 3,
-    box.padding = 0.8,
-    max.overlaps = Inf
+volc <- ggplot(volc_main, aes(x = logFC, y = negLog10FDR)) +
+  geom_point(aes(shape = dir), alpha = 0.6) +
+  geom_hline(yintercept = -log10(FDR_THRESH), linetype = 2) +
+  geom_vline(xintercept = c(-LOGFC_THRESH, LOGFC_THRESH), linetype = 3) +
+  ggrepel::geom_text_repel(
+    data = lab_main,
+    aes(label = SYMBOL),
+    size = 3, max.overlaps = 100
   ) +
-  scale_color_manual(values = colors) +
-  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray") +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray") +
-  labs(
-    title = "Volcano Plot",
-    x = expression(Log[2]~fold~change),
-    y = expression(-Log[10]~P),
-    color = "",
-    caption = paste("total =", nrow(deg_results_all), "variables")
-  ) +
-  theme_bw(base_size = 14) +
-  theme(
-    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, vjust = 2),
-    plot.caption = element_text(size = 12, hjust = 0.5, face = "italic"),
-    panel.grid = element_blank(),
-    legend.position = "right"
-  ) +
-  guides(color = guide_legend(override.aes = list(size = 4)))
+  theme_bw(14) +
+  labs(title = "Volcano (Pompe vs Control) — Main",
+       x = "log2 Fold Change", y = "-log10(FDR)")
+ggsave(file.path(plot_dir, "volcano_main.png"), volc, width = 8, height = 6, dpi = 300)
 
-volcano_plot
+if (exists("tt_all_s") && exists("deg_sens")) {
+  volc_s <- within(tt_all_s, {
+    negLog10FDR <- -log10(adj.P.Val)
+    sig <- adj.P.Val < FDR_THRESH
+    dir <- ifelse(sig & logFC > 0, "Up",
+                  ifelse(sig & logFC < 0, "Down", "NS"))
+  })
+  lab_s <- head(volc_s[order(volc_s$adj.P.Val, -abs(volc_s$logFC)), ], 15)
+  lab_s$SYMBOL[is.na(lab_s$SYMBOL) | lab_s$SYMBOL == ""] <- rownames(lab_s)[is.na(lab_s$SYMBOL) | lab_s$SYMBOL == ""]
+  
+  p_s <- ggplot(volc_s, aes(x = logFC, y = negLog10FDR)) +
+    geom_point(aes(shape = dir), alpha = 0.6) +
+    geom_hline(yintercept = -log10(FDR_THRESH), linetype = 2) +
+    geom_vline(xintercept = c(-LOGFC_THRESH, LOGFC_THRESH), linetype = 3) +
+    ggrepel::geom_text_repel(
+      data = lab_s,
+      aes(label = SYMBOL),
+      size = 3, max.overlaps = 100
+    ) +
+    theme_bw(14) +
+    labs(title = "Volcano (Pompe vs Control) — MELAS excluded",
+         x = "log2 Fold Change", y = "-log10(FDR)")
+  ggsave(file.path(plot_dir, "volcano_noMELAS_main.png"), p_s, width = 8, height = 6, dpi = 300)
+}
 
-# -----------------------------------HEATMAP------------------------------------
 
-# Top 50 genes for heatmap
-top_genes <- rownames(deg_results)[1:50]
-expr_top <- expr_matrix[top_genes, ]
-annotation_col <- data.frame(Group = groups)
-rownames(annotation_col) <- colnames(expr_top)
+expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f  # batch/SVA sonrası
 
-# If not loaded:
-if (!require("pheatmap")) install.packages("pheatmap")
-library(pheatmap)
+stopifnot(exists("tt_gene"), exists("deg"))
+stopifnot(nrow(deg) > 0)
 
-ph <- pheatmap(
-  expr_top,
-  scale = "row",
-  show_rownames = FALSE,
-  annotation_col = annotation_col,
-  main = "Top 50 DEG Heatmap",
-  silent = TRUE   # Make sure to add this! It saves the plot to the object, not prints it on the screen.
-)
+expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f
 
-ph
+TOP_N <- min(50, nrow(deg))
+stopifnot(TOP_N >= 1)
 
-# -----------------------------------------------------
-# Fig 1
-# -----------------------------------------------------
+tt_gene$SYMBOL <- as.character(tt_gene$SYMBOL)
+deg$SYMBOL     <- as.character(deg$SYMBOL)
 
-library(gridExtra)
-library(grid)
+top_syms <- head(deg$SYMBOL[order(deg$adj.P.Val)], TOP_N)
 
-pdf("volcano_heatmap_high_quality.pdf", width = 16, height = 8, family = "Times")  # Geniş, yüksek çözünürlüklü
-grid.arrange(
-  arrangeGrob(volcano_plot, top = textGrob("A", gp = gpar(fontsize=22, fontface="bold"), x = unit(0, "npc"), hjust = 0)),
-  arrangeGrob(ph$gtable,     top = textGrob("B", gp = gpar(fontsize=22, fontface="bold"), x = unit(0, "npc"), hjust = 0)),
-  ncol = 2
-)
+reps <- rownames(tt_gene)[ match(top_syms, tt_gene$SYMBOL) ]
+reps <- unique(reps[!is.na(reps)])
+
+sub_expr <- expr_plot[ intersect(rownames(expr_plot), reps), , drop = FALSE ]
+stopifnot(nrow(sub_expr) > 0)   # mantıksal test
+
+rownames(sub_expr) <- tt_gene$SYMBOL[ match(rownames(sub_expr), rownames(tt_gene)) ]
+  
+ann_col <- data.frame(Group = pheno_aligned$group,
+                      row.names = rownames(pheno_aligned))
+if ("batch" %in% names(pheno_aligned))
+  ann_col$Batch <- pheno_aligned$batch
+
+if ("is_melas" %in% names(pheno_aligned)) {
+  melas_raw <- pheno_aligned$is_melas
+  melas_log <- if (is.logical(melas_raw)) {
+    melas_raw
+  } else {
+    v <- tolower(trimws(as.character(melas_raw)))
+    v %in% c("1","true","t","yes","y")
+  }
+  melas_log[is.na(melas_log)] <- FALSE  # boşları "No" say
+  ann_col$MELAS <- ifelse(melas_log, "Yes", "No")
+}
+
+ord <- order(ann_col$Group, ann_col$Batch, na.last = TRUE)
+ann_col <- ann_col[ord, , drop = FALSE]
+sub_expr <- sub_expr[, rownames(ann_col), drop = FALSE]
+
+if (TOP_N >= 1) {  
+  sub_expr_z <- t(scale(t(sub_expr)))  # satır bazlı z-score
+  
+  if (nrow(sub_expr_z) >= 2) {
+    ph <- pheatmap::pheatmap(sub_expr_z,
+                             annotation_col = ann_col,
+                             show_rownames = TRUE, show_colnames = TRUE,
+                             clustering_distance_rows = "correlation",
+                             clustering_distance_cols = "correlation",
+                             clustering_method = "average",
+                             main = sprintf("Top %d DEG (z-score by gene) – Pompe vs Control", nrow(sub_expr_z)),
+                       filename = file.path(plot_dir, sprintf("heatmap_top_FDR%s_main.png", FDR_THRESH))
+    )
+    
+  } else if (nrow(sub_expr_z) == 1) {
+    ph <- pheatmap::pheatmap(sub_expr_z,
+                             annotation_col = ann_col,
+                             show_rownames = TRUE, show_colnames = TRUE,
+                             cluster_rows = FALSE, cluster_cols = TRUE,
+                             main = "Only 1 gene passed filter (no row clustering)",
+                       filename = file.path(plot_dir, sprintf("heatmap_top_FDR%s_main.png", FDR_THRESH))
+    )
+    
+  } else {
+    message("Heatmap atlandı: seçilen genlerden hiçbiri ifade matrisinde bulunamadı (probe vs gene adı?).")
+  }
+  
+} else {
+  message(sprintf("Heatmap atlandı: FDR<%s ile yeterli gen yok.", FDR_THRESH))
+}
+
+
+if (exists("tt_gene_s") && exists("expr_sens") && exists("ph_sens")) {
+  top_gene_tbl_s <- head(tt_gene_s[order(tt_gene_s$adj.P.Val, -abs(tt_gene_s$logFC)), ], TOP_N)
+  top_probes_s <- rownames(top_gene_tbl_s)
+  sub_expr_s <- expr_sens[intersect(rownames(expr_sens), top_probes_s), , drop = FALSE]
+  sub_expr_s_z <- t(scale(t(sub_expr_s)))
+  
+  ann_col_s <- data.frame(
+    Group = ph_sens$group
+  )
+  if ("batch" %in% names(ph_sens)) ann_col_s$Batch <- ph_sens$batch
+  rownames(ann_col_s) <- rownames(ph_sens)
+  
+  ord_s <- order(ann_col_s$Group, ann_col_s$Batch, decreasing = FALSE, na.last = TRUE)
+  sub_expr_s_z <- sub_expr_s_z[, ord_s, drop = FALSE]
+  ann_col_s    <- ann_col_s[ord_s, , drop = FALSE]
+  
+  png(file.path(plot_dir, sprintf("heatmap_top%d_genes_noMELAS.png", TOP_N)),
+      width = 1100, height = 1400, res = 150)
+  pheatmap(sub_expr_s_z,
+           annotation_col = ann_col_s,
+           show_rownames = TRUE, show_colnames = TRUE,
+           clustering_distance_rows = "correlation",
+           clustering_distance_cols = "correlation",
+           clustering_method = "average",
+           main = sprintf("Top %d genes (z-score) — Pompe vs Control (no MELAS)", TOP_N))
+  dev.off()
+}
+
+message("Plots written to: ", plot_dir)
+
+gsea_dir <- file.path(root_dir, "results", "deg")
+dir.create(gsea_dir, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(1234)
+
+stopifnot(exists("tt_gene"))
+ranks <- tt_gene$t
+names(ranks) <- tt_gene$SYMBOL
+ranks <- ranks[!is.na(ranks) & nzchar(names(ranks))]
+ranks <- sort(ranks, decreasing = TRUE)
+
+if (length(ranks) < 50) {
+  warning("GSEA için yeterli sayıda gen yok gibi (rank < 50). Sonuçlar güvenilmez olabilir.")
+}
+
+msig <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+#msig <- try(msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP"), silent=TRUE)
+if (inherits(msig, "try-error") || nrow(msig)==0) {
+  msig <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
+}
+term2gene <- unique(msig[, c("gs_name","gene_symbol")])
+
+term2gene <- unique(msig[, c("gs_name","gene_symbol")])
+gsea_go <- GSEA(geneList = ranks, TERM2GENE = term2gene,
+                pvalueCutoff = FDR_THRESH, verbose = FALSE)
+
+write.csv(as.data.frame(gsea_go),
+          file.path(gsea_dir, "GSEA_GO_BP_msigdb.csv"), row.names = FALSE)
+
+png(file.path(gsea_dir, "GSEA_GO_BP_dotplot.png"), width=1000, height=800, res=130)
+print(dotplot(gsea_go, showCategory = 20))
 dev.off()
 
-# -----------------------------------GO AND KEGG ANALYSIS-----------------------
-
-# -----------------------------------------------------
-# 1. Install relevant packages
-# -----------------------------------------------------
-# You need the following Bioconductor and CRAN packages for this analysis:
-# clusterProfiler, org.Hs.eg.db, enrichplot, ggplot2, DOSE, GOSemSim
-
-library(clusterProfiler)
-library(org.Hs.eg.db)
-library(enrichplot)
-library(ggplot2)
-library(DOSE)
-library(GOSemSim)
-
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-
-necessary_pkgs <- c("clusterProfiler", "org.Hs.eg.db", "enrichplot", "ggplot2", "DOSE", "GOSemSim")
-for (pkg in necessary_pkgs) {
-  if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg)
-  library(pkg, character.only = TRUE)
-}
-
-# -----------------------------------------------------
-# 2. Prepare the Significant Gene List
-# -----------------------------------------------------
-#We draw the symbols of genes found to be significant from differential expression analysis.
-significant_genes <- deg_results$Gene.Symbol[!is.na(deg_results$Gene.Symbol)]
-significant_genes <- unique(significant_genes)
-
-# -----------------------------------------------------
-# 3. GO Biological Process (BP) Enrichment Analysis
-# -----------------------------------------------------
-go_bp <- enrichGO(
-  gene = significant_genes,
-  OrgDb = org.Hs.eg.db,     # Human Database
-  keyType = "SYMBOL",       # Gene Key: Symbol
-  ont = "BP",               # BP: Biological Process ontology
-  pvalueCutoff = 0.05,      # p-value threshold
-  qvalueCutoff = 0.05,      # FDR corrected threshold
-  readable = TRUE           # Convert gene IDs to readable names
-)
-
-#Save results as CSV (full table)
-write.csv(as.data.frame(go_bp), "GO_Biological_Process.csv", row.names = FALSE)
-
-# -----------------------------------------------------
-# 4. KEGG Pathway Enrichment Analysis
-# -----------------------------------------------------
-# In KEGG analysis, genes must be in Entrez ID format!
-entrez_ids <- mapIds(
-  org.Hs.eg.db,
-  keys = significant_genes,
-  column = "ENTREZID",
-  keytype = "SYMBOL",
-  multiVals = "first"
-)
-entrez_ids <- na.omit(entrez_ids)
-
-kegg <- enrichKEGG(
-  gene = entrez_ids,
-  organism = 'hsa',          # Homo sapiens
-  pvalueCutoff = 0.05
-)
-
-write.csv(as.data.frame(kegg), "KEGG_Enrichment.csv", row.names = FALSE)
-barplot(kegg, showCategory = 15, title = "KEGG Pathways")
-browseKEGG(kegg, 'hsa04142')  # example: Lysosome pathway can be added to other pathwaysr
-
-
-# -----------------------------------------------------
-# 5. Visualization of GO Results
-# -----------------------------------------------------
-
-library(GOSemSim)
-
-if (nrow(go_bp) > 0) {
-  # Dotplot: The 10 most enriched GO terms
-  p1 <- dotplot(go_bp, showCategory = 10, title = "GO Biological Process")
-  ggsave("GO_BP_dotplot.png", plot = p1, width = 10, height = 10)
-  ggsave("GO_BP_dotplot.pdf", plot = p1, width = 10, height = 10)
-  
-  # Barplot: Alternative visualization
-  p2 <- barplot(go_bp, showCategory = 10, title = "GO Biological Process")
-  ggsave("GO_BP_barplot.png", plot = p2, width = 10, height = 10)
-  ggsave("GO_BP_barplot.pdf", plot = p2, width = 10, height = 10)
-  
-  # Semantic Similarity (for emapplot): Semantic similarity matrix between terms
-  hsGO <- godata('org.Hs.eg.db', ont = "BP")
-  go_bp_sim <- pairwise_termsim(go_bp, semData = hsGO)
-  
-  # emapplot: Network of relationships between GO terms
-  tryCatch({
-    p3 <- emapplot(go_bp_sim, showCategory = 10)
-    ggsave("GO_BP_emapplot.png", plot = p3, width = 10, height = 10)
-  }, error = function(e) cat("Could not create emapplot:", e$message, "\n"))
-  ggsave("GO_BP_emapplot.pdf", plot = p3, width = 10, height = 10)
-  
-  # cnetplot: Network showing Gen-GO term relationships
-  tryCatch({
-    p4 <- cnetplot(go_bp, categorySize = "pvalue", foldChange = NULL)
-    ggsave("GO_BP_cnetplot.png", plot = p4, width = 12, height = 10)
-  }, error = function(e) cat("Could not create cnetplot:", e$message, "\n"))
-  ggsave("GO_BP_cnetplot.pdf", plot = p4, width = 12, height = 10)
-  
-  # Custom Dotplot (with ggplot2)
-  go_df <- as.data.frame(go_bp)
-  top_go <- head(go_df[order(go_df$p.adjust), ], 15)
-  
-  p5 <- ggplot(top_go, aes(x = -log10(p.adjust), y = reorder(Description, -log10(p.adjust)))) +
-    geom_point(aes(size = Count, color = -log10(p.adjust))) +
-    scale_color_gradient(low = "blue", high = "red") +
-    labs(title = "GO Biological Process (Custom)",
-         x = "-log10(Adjusted P-value)", y = "GO Term") +
-    theme_minimal() +
-    theme(axis.text.y = element_text(size = 10))
-  ggsave("GO_BP_custom_dotplot.png", plot = p5, width = 12, height = 10)
-  ggsave("GO_BP_custom_dotplot.pdf", plot = p5, width = 12, height = 10)
-  
-  # Save the 10 most significant terms as a separate CSV
-  write.csv(top_go[1:10, ], "Top_GO_Terms.csv", row.names = FALSE)
-  
-} else {
-  cat("No GO enrichment results found.\n")
-}
-
-# -----------------------------------------------------
-# 6. Visualizing KEGG Results
-# -----------------------------------------------------
-if (nrow(as.data.frame(kegg)) > 0) {
-  p_kegg <- barplot(kegg, showCategory = 15, title = "KEGG Pathways")
-  ggsave("KEGG_barplot.png", plot = p_kegg, width = 10, height = 10)
-} else {
-  cat("No KEGG enrichment results found.\n")
-}
-ggsave("KEGG_barplot.pdf", plot = p_kegg, width = 10, height = 10)
-
-# -----------------------------------------------------
-# 7. Examining the Results Table for
-# -----------------------------------------------------
-# If you want to open GO enrichment results as a table:
-go_df <- as.data.frame(go_bp)
-View(go_df)
-
-library(clusterProfiler)
-library(ggplot2)
-
-# Example: enrichKEGG output
-# kegg <- enrichKEGG(gene = entrez_ids, organism = 'hsa', pvalueCutoff = 0.05)
-
-# Get KEGG results as a dataframe
-kegg_df <- as.data.frame(kegg)
-
-# Select the 10 most significant (lowest p.adj) pathways
-top_kegg <- head(kegg_df[order(kegg_df$p.adjust), ], 10)
-
-# Barplot: With ggplot2 
-ggplot(top_kegg, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
-  geom_bar(stat = "identity") +
-  scale_fill_gradient(low = "#377eb8", high = "#e41a1c") +
-  labs(
-    title = "KEGG Pathways",
-    x = "Count",
-    y = NULL,
-    fill = "p.adjust"
-  ) +
-  theme_minimal(base_size = 16)
-
-ggsave("KEGG_barplot.png", width = 10, height = 10)
-ggsave("KEGG_barplot.pdf", width = 10, height = 10)
-
-
-# -----------------------------------miRNA ANALYSIS----------------------------
-
-# — Completed (normalization, limma, annotation, heatmap, GO/KEGG…)
-
-# 1. NA / Infinite value check
-if (any(is.na(expr_matrix))) {
-  expr_matrix[is.na(expr_matrix)] <- rowMeans(expr_matrix, na.rm = TRUE)[row(expr_matrix)[is.na(expr_matrix)]]
-}
-
-if (any(is.infinite(expr_matrix))) {
-  expr_matrix[is.infinite(expr_matrix)] <- quantile(expr_matrix, 0.99, na.rm = TRUE)
-}
-
-cat("Expression matrix size:", dim(expr_matrix), "\n")
-cat("Design matrix size:", dim(design), "\n")
-
-# 2. Analysis with alternative simple model LM
-
-group_list <- factor(c(rep("Control", 10), rep("Pompe", 9)), levels = c("Control", "Pompe"))
-
-gs <- group_list
-design_simple <- model.matrix(~ gs)
-fit_simple <- lmFit(as.matrix(expr_matrix), design_simple)
-fit_simple <- eBayes(fit_simple)
-
-deg_simple <- topTable(fit_simple, coef = "gsPompe", number = Inf,
-                       adjust.method = "BH", p.value = 0.05, lfc = 1)
-
-write.csv(deg_simple, "Pompe_vs_Control_simple_DEGs.csv", row.names = TRUE)
-deg_table <- read.csv("Pompe_vs_Control_simple_DEGs.csv", stringsAsFactors = FALSE)
-View(deg_table)  # Shows the table in a new tab in RStudio
-
-
-
-# Install the required package (hgu133plus2.db or Adding symbols with biomaRt annotation)
-
-if (!requireNamespace("hgu133plus2.db")) BiocManager::install("hgu133plus2.db")
-library(hgu133plus2.db)
-library(biomaRt)
-
-# … (your annotation code will be here)
-# 3. Retrieve the probe IDs in order.
-probe_ids <- rownames(deg_table)
-
-# 4. Match the symbol with select() (ENTREZID, GENENAME can also be added if desired)
-anno_df <- select(hgu133plus2.db,
-                  keys = probe_ids,
-                  columns = c("SYMBOL", "GENENAME"),
-                  keytype = "PROBEID")
-
-# 5. Merge the resulting annotation table with the original DEG table.
-# (note the order! - probeID must be unique)
-deg_table$SYMBOL <- anno_df$SYMBOL[match(probe_ids, anno_df$PROBEID)]
-deg_table$GENENAME <- anno_df$GENENAME[match(probe_ids, anno_df$PROBEID)]
-write.csv(deg_table, "DEG_Table_Annotated.csv")  # Save the results
-
-# 6. WebGestaltR + miRNA analysis
-
-if (!require("WebGestaltR", quietly=TRUE)) {
-  BiocManager::install("WebGestaltR")
-  library(WebGestaltR)
-}
-significant_genes <- unique(deg_results$Gene.Symbol[!is.na(deg_results$Gene.Symbol)])
-available_dbs <- WebGestaltR::listGeneSet(organism="hsapiens")
-miRNA_dbs <- available_dbs[grep("miRNA", available_dbs$name, ignore.case=TRUE), ]
-print(miRNA_dbs)
-
-# 7. PATHWAY analysis via WebGestaltR
-pathway_result <- WebGestaltR(
-  enrichMethod="ORA", organism="hsapiens",
-  enrichDatabase="pathway_KEGG",
-  interestGene=significant_genes,
-  interestGeneType="genesymbol", referenceSet="genome",
-  minNum=5, fdrThr=0.05,
-  isOutput=TRUE, outputDirectory=getwd(),
-  projectName="Pompe_Pathway_Analysis"
-)
-View(pathway_result)  # View in RStudio
-top_pw <- head(pathway_result[order(pathway_result$FDR), ], 10)
-barplot(-log10(top_pw$FDR), names.arg=top_pw$description, las=2, cex.names=0.7,
-        main="Top KEGG pathways", ylab="-log10(FDR)", col="skyblue")
-
-
-# 8. validated (simplified) with multiMiR
-
-# 8a. Query only reliable and working databases (except targetscan)
-if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
-library(multiMiR)
-
-# Start with a short list of genes
-test_genes <- head(significant_genes, 10)
-
-mm_fast <- tryCatch({
-  get_multimir(
-    org = "hsa",
-    target = test_genes,
-    table = "validated",
-    summary = TRUE
-  )
-}, error = function(e) {
-  message("Query error: ", e$message)
-  return(NULL)
-})
-
-if (!is.null(mm_fast)) {
-  # Just get the mirTarBase records!
-  mirtarbase_data <- subset(mm_fast@data, database == "mirtarbase")
-  print(head(mirtarbase_data))
-  
-  # Visualize miRNA target count
-  mmr_sum <- with(mirtarbase_data, tapply(type, mature_mirna_id, length))
-  top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-  barplot(top_mmrs, las = 2, col = "darkred", main = "mirTarBase: Top miRNA Target Count")
-} else {
-  cat("Could not retrieve data from multiMiR query.\n")
-}
-
-###############################################################################
-
-if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
-library(multiMiR)
-library(ggplot2)
-
-# 1. Use a short list of genes for testing
-test_genes <- head(significant_genes, 10)
-
-# 2. Query and pivot table for each database
-databases <- c("mirtarbase", "mirecords", "tarbase")
-df_list <- list()
-
-for (db in databases) {
-  mm_db <- tryCatch({
-    get_multimir(
-      org = "hsa",
-      target = test_genes,
-      table = "validated",
-      summary = TRUE
-    )
-  }, error = function(e) return(NULL))
-  
-  if (!is.null(mm_db)) {
-    db_data <- subset(mm_db@data, database == db)
-    if (nrow(db_data) > 0) {
-      # miRNA target number
-      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
-      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-      df_tmp <- data.frame(
-        miRNA = names(top_mmrs),
-        Target_Count = as.numeric(top_mmrs),
-        Database = db
-      )
-      df_list[[db]] <- df_tmp
-    }
+if (nrow(as.data.frame(gsea_go)) > 0) {
+  top_terms <- head(gsea_go@result$ID, 2)
+  for (id in top_terms) {
+    png(file.path(gsea_dir, paste0("GSEA_GO_BP_runningplot_", gsub("[^A-Za-z0-9]+","_", id), ".png")),
+        width=1100, height=700, res=130)
+    print(gseaplot2(gsea_go, geneSetID = id))
+    dev.off()
   }
 }
 
-# 3. Single combined data.frame
-df_all <- do.call(rbind, df_list)
+sym2ent <- sym2ent[!is.na(sym2ent$ENTREZID) & nzchar(sym2ent$SYMBOL), ]
+sym2ent$abs_rank <- abs(ranks[sym2ent$SYMBOL])
+sym2ent <- sym2ent[order(sym2ent$abs_rank, decreasing = TRUE), ]
+sym2ent_1to1 <- sym2ent[!duplicated(sym2ent$SYMBOL), c("SYMBOL","ENTREZID")]
 
-# 4. Barplot - Comparison in a single chart
-ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
-  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.7) +
-  labs(title = "Top miRNAs by Database (Validated)", x = "miRNA", y = "Number of Validated Targets") +
-  theme_minimal(base_size = 13) +
-  coord_flip()
+ranks_kegg <- ranks[sym2ent_1to1$SYMBOL]
+names(ranks_kegg) <- sym2ent_1to1$ENTREZID
+ranks_kegg <- ranks_kegg[!duplicated(names(ranks_kegg))]
+ranks_kegg <- sort(ranks_kegg, decreasing = TRUE)
 
-################################################################################
-
-#Create df containing miRNA target number
-library(ggplot2)
-
-df_mirtar <- data.frame(
-  miRNA = names(top_mmrs),
-  Target_Count = as.numeric(top_mmrs)
-)
-
-# If necessary, sort miRNA names (largest to smallest)
-df_mirtar$miRNA <- factor(df_mirtar$miRNA, levels = df_mirtar$miRNA[order(df_mirtar$Target_Count)])
-
-# Barplot (ggplot2, horizontal and color)
-ggplot(df_mirtar, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
-  geom_bar(stat = "identity", width = 0.7) +
-  coord_flip() +
-  scale_fill_gradient(low = "#FFBABA", high = "#B22222") + # Red tones
-  theme_minimal(base_size = 14) +
-  labs(title = "mirTarBase: Top miRNA Target Count",
-       x = "miRNA",
-       y = "Number of Validated Targets",
-       fill = "Target Count")
-
-################################################################################
-
-library(ggplot2)
-
-mirna_info <- data.frame(
-  miRNA = c("hsa-miR-628-3p", "hsa-miR-5011-5p", "hsa-miR-3923", "hsa-miR-3121-3p", 
-            "hsa-miR-190a-3p", "hsa-miR-107", "hsa-miR-103a-3p", 
-            "hsa-miR-199b-3p", "hsa-miR-199a-5p", "hsa-miR-155-5p"),
-  Target_Count = c(6,6,6,6,6,6,5,4,4,4),  # The numbers in your analysis
-  Function = c(
-    "Tumor suppression, inflammation",
-    "Emerging, neuro/cancer",
-    "Cell cycle, apoptosis",
-    "Growth, proliferation",
-    "Neural, cardiovascular disease",
-    "Insulin resistance, tumor suppression",
-    "Glucose/lipid metabolism",
-    "Tumor suppression, fibrosis",
-    "Cardiovascular, cancer, fibrosis",
-    "Immunity, inflammation, cancer"
-  )
-)
-
-ggplot(mirna_info, aes(x = Target_Count, y = reorder(miRNA, Target_Count), fill = Target_Count)) +
-  geom_bar(stat = "identity", width = 0.7) +
-  geom_text(aes(label = Function), hjust = -0.02, size = 3.2) +
-  scale_fill_gradient(low = "#FFBABA", high = "#B22222") +
-  labs(title = "Top miRNAs (mirTarBase) with Functions",
-       x = "Number of Validated Targets",
-       y = "miRNA") +
-  theme_minimal(base_size = 14) +
-  xlim(0, max(mirna_info$Target_Count)+2)  # Space for functions
-
-################################################################################ 
-
-if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
-if (!require("ggplot2", quietly=TRUE)) install.packages("ggplot2")
-library(multiMiR)
-library(ggplot2)
-
-test_genes <- head(significant_genes, 10)
-
-mm <- tryCatch({
-  get_multimir(
-    org = "hsa",
-    target = test_genes,             # (validated, summary TRUE)
-    table = "validated",
-    summary = TRUE
-  )
-}, error = function(e) {
-  message("Query error: ", e$message)
-  return(NULL)
-})
-
-# Analysis and barplot cycle for each database
-if (!is.null(mm)) {
-  all_db <- unique(mm@data$database)
+if (length(ranks_kegg) >= 50) {
+  gsea_kegg <- gseKEGG(geneList = ranks_kegg,
+                       organism = "hsa",
+                       pvalueCutoff = 0.1,
+                       verbose = FALSE)
+  write.csv(as.data.frame(gsea_kegg),
+            file.path(gsea_dir, "GSEA_KEGG.csv"), row.names = FALSE)
   
-  for (db in all_db) {
-    cat("\n\n---", db, "results ---\n")
-    db_data <- subset(mm@data, database == db)
-    if (nrow(db_data) == 0) next
+  png(file.path(gsea_dir, "GSEA_KEGG_dotplot.png"), width=1000, height=800, res=130)
+  print(dotplot(gsea_kegg, showCategory = 20))
+  dev.off()
+} else {
+  message("KEGG GSEA atlandı: ENTREZ eşleşmesi az ( < 50 ).")
+}
+
+if (exists("tt_gene_s")) {
+  ranks_s <- tt_gene_s$t
+  names(ranks_s) <- tt_gene_s$SYMBOL
+  ranks_s <- ranks_s[!is.na(ranks_s) & nzchar(names(ranks_s))]
+  ranks_s <- sort(ranks_s, decreasing = TRUE)
+  
+  if (length(ranks_s) >= 50) {
+    gsea_go_s <- GSEA(geneList = ranks_s, TERM2GENE = term2gene,
+                      pvalueCutoff = FDR_THRESH, verbose = FALSE)
+    write.csv(as.data.frame(gsea_go_s),
+              file.path(gsea_dir, "GSEA_GO_BP_msigdb_noMELAS.csv"), row.names = FALSE)
     
-    # Calculate the number of miRNA targets
-    mirna_counts <- with(db_data, tapply(type, mature_mirna_id, length))
-    top_mirs <- head(sort(mirna_counts, decreasing = TRUE), 10)
+    png(file.path(gsea_dir, "GSEA_GO_BP_dotplot_noMELAS.png"), width=1000, height=800, res=130)
+    print(dotplot(gsea_go_s, showCategory = 20))
+    dev.off()
+  } else {
+    message("no-MELAS GSEA atlandı: yeterli rank yok.")
+  }
+}
+
+if (exists("ph")) {
+  pdf(file.path(root_dir,"results","plots","volcano_heatmap_Fig1.pdf"), width=16, height=8, family="Times")
+  grid.arrange(
+    arrangeGrob(volc, top = textGrob("A", gp=gpar(fontsize=22, fontface="bold"), x=unit(0,"npc"), hjust=0)),
+    arrangeGrob(ph$gtable, top = textGrob("B", gp=gpar(fontsize=22, fontface="bold"), x=unit(0,"npc"), hjust=0)),
+    ncol = 2
+  )
+  dev.off()
+}
+
+# =======================    ENRICHMENT: GO / KEGG / GSEA + MELAS       =======================
+
+enrich_dir <- file.path(root_dir, "results", "enrichment"); dir.create(enrich_dir, recursive = TRUE, showWarnings = FALSE)
+plot_dir   <- file.path(root_dir, "results", "plots");       dir.create(plot_dir,   recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(exists("tt_gene"), exists("deg"))
+if (nrow(deg) == 0) stop("No DEGs detected; adjust thresholds.")
+sig_symbols      <- unique(na.omit(as.character(deg$SYMBOL)))
+universe_symbols <- unique(na.omit(as.character(tt_gene$SYMBOL)))
+
+writeLines(sig_symbols,      file.path(enrich_dir, "_sig_gene_symbols.txt"))
+writeLines(universe_symbols, file.path(enrich_dir, "_universe_gene_symbols.txt"))
+
+sym2entrez      <- bitr(universe_symbols, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+entrez_universe <- unique(na.omit(sym2entrez$ENTREZID))
+sig2entrez      <- bitr(sig_symbols, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+entrez_sig      <- unique(na.omit(sig2entrez$ENTREZID))
+
+meta <- list(time=as.character(Sys.time()),
+             n_sig_genes=length(sig_symbols), n_universe_genes=length(universe_symbols),
+             n_sig_entrez=length(entrez_sig), n_universe_entrez=length(entrez_universe),
+             adjust_method="BH", pvalueCutoff=FDR_THRESH, qvalueCutoff=FDR_THRESH)
+writeLines(jsonlite::toJSON(meta, pretty=TRUE), file.path(enrich_dir, "_params_enrichment_main.json"))
+
+go_bp <- enrichGO(gene = sig_symbols, OrgDb = org.Hs.eg.db, keyType = "SYMBOL",
+                  ont = "BP", universe = universe_symbols,
+                  pAdjustMethod = "BH", pvalueCutoff = FDR_THRESH, qvalueCutoff = FDR_THRESH,
+                  readable = TRUE)
+write.csv(as.data.frame(go_bp), file.path(enrich_dir,"GO_BP_main.csv"), row.names = FALSE)
+
+ek_args <- list(gene = entrez_sig, organism = "hsa", pAdjustMethod = "BH", pvalueCutoff = FDR_THRESH)
+if ("universe" %in% names(formals(clusterProfiler::enrichKEGG))) ek_args$universe <- entrez_universe
+kegg <- do.call(clusterProfiler::enrichKEGG, ek_args)
+write.csv(as.data.frame(kegg), file.path(enrich_dir,"KEGG_main.csv"), row.names = FALSE)
+
+gl_df <- tt_gene[, c("SYMBOL","t","logFC")]
+gl_df$t[is.na(gl_df$t)] <- gl_df$logFC[is.na(gl_df$t)]
+gl_df <- merge(gl_df, sym2entrez, by.x="SYMBOL", by.y="SYMBOL", all.x=TRUE)
+gl_df <- gl_df[!is.na(gl_df$ENTREZID), c("ENTREZID","t")]
+geneList <- gl_df$t; names(geneList) <- gl_df$ENTREZID; geneList <- sort(geneList, decreasing = TRUE)
+
+gsea_go   <- NULL
+gsea_kegg <- NULL
+if (length(geneList) >= 20) {
+  gsea_go   <- try(gseGO(geneList = geneList, OrgDb = org.Hs.eg.db, keyType = "ENTREZID",
+                         ont = "BP", pAdjustMethod = "BH", verbose = FALSE), silent = TRUE)
+  gsea_kegg <- try(gseKEGG(geneList = geneList, organism = "hsa", pAdjustMethod = "BH", verbose = FALSE), silent = TRUE)
+  if (!inherits(gsea_go, "try-error"))   write.csv(as.data.frame(gsea_go),   file.path(enrich_dir,"GSEA_GO_BP_main.csv"),   row.names = FALSE)
+  if (!inherits(gsea_kegg, "try-error")) write.csv(as.data.frame(gsea_kegg), file.path(enrich_dir,"GSEA_KEGG_main.csv"),    row.names = FALSE)
+}
+if (!is.null(go_bp) && nrow(as.data.frame(go_bp)) > 0) {
+  p_go_dot <- dotplot(go_bp, showCategory = 15, title = "GO BP (BH, explicit universe)")
+  ggsave(file.path(plot_dir,"GO_BP_dotplot_main.png"), p_go_dot, width=10, height=9, dpi=300)
+  p_go_bar <- barplot(go_bp, showCategory = 15, title = "GO BP (BH, explicit universe)")
+  ggsave(file.path(plot_dir,"GO_BP_barplot_main.png"), p_go_bar, width=10, height=9, dpi=300)
+  
+  hsGO <- try(godata('org.Hs.eg.db', ont="BP"), silent=TRUE)
+  if (!inherits(hsGO,"try-error")) {
+    s <- try(pairwise_termsim(go_bp, semData=hsGO), silent=TRUE)
+    if (!inherits(s,"try-error")) {
+      p_emap <- try(emapplot(s, showCategory=15), silent=TRUE)
+      if (!inherits(p_emap,"try-error")) ggsave(file.path(plot_dir,"GO_BP_emapplot_main.png"), p_emap, width=10, height=10, dpi=300)
+    }
+  }
+}
+if (!is.null(kegg) && nrow(as.data.frame(kegg)) > 0) {
+  p_kegg <- barplot(kegg, showCategory = 15, title = "KEGG (BH)")
+  ggsave(file.path(plot_dir,"KEGG_barplot_main.png"), p_kegg, width=10, height=9, dpi=300)
+}
+if (!is.null(gsea_go) && !inherits(gsea_go,"try-error") && nrow(as.data.frame(gsea_go))>0) {
+  p_gsea1 <- gseaplot2(gsea_go, geneSetID = head(gsea_go@result$ID,1), title = "GSEA GO BP (top set)")
+  ggsave(file.path(plot_dir,"GSEA_GO_BP_topset_main.png"), p_gsea1, width=10, height=6, dpi=300)
+}
+if (!is.null(gsea_kegg) && !inherits(gsea_kegg,"try-error") && nrow(as.data.frame(gsea_kegg))>0) {
+  p_gsea2 <- gseaplot2(gsea_kegg, geneSetID = head(gsea_kegg@result$ID,1), title = "GSEA KEGG (top pathway)")
+  ggsave(file.path(plot_dir,"GSEA_KEGG_topset_main.png"), p_gsea2, width=10, height=6, dpi=300)
+}
+
+enrich_melas <- function(deg_tbl, tag) {
+  sig_syms <- unique(na.omit(as.character(deg_tbl$SYMBOL)))
+  if (length(sig_syms) < 3) return(invisible(NULL))
+  sig_ent  <- unique(na.omit(bitr(sig_syms, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID))
+  
+  go <- enrichGO(gene=sig_syms, OrgDb=org.Hs.eg.db, keyType="SYMBOL",
+                 ont="BP", universe=universe_symbols,
+                 pAdjustMethod="BH", pvalueCutoff=FDR_THRESH, qvalueCutoff=FDR_THRESH, readable=TRUE)
+  write.csv(as.data.frame(go), file.path(enrich_dir, paste0("GO_BP_",tag,".csv")), row.names=FALSE)
+  
+  ek_args <- list(gene=sig_ent, organism="hsa", pAdjustMethod="BH", pvalueCutoff=FDR_THRESH)
+  if ("universe" %in% names(formals(clusterProfiler::enrichKEGG))) ek_args$universe <- entrez_universe
+  kk <- do.call(clusterProfiler::enrichKEGG, ek_args)
+  write.csv(as.data.frame(kk), file.path(enrich_dir, paste0("KEGG_",tag,".csv")), row.names=FALSE)
+  
+  if (!is.null(go) && nrow(as.data.frame(go))>0) {
+    ggsave(file.path(plot_dir, paste0("GO_BP_dotplot_",tag,".png")),
+           dotplot(go, showCategory=15, title=paste0("GO BP (",tag,")")), width=10, height=9, dpi=300)
+  }
+  if (!is.null(kk) && nrow(as.data.frame(kk))>0) {
+    ggsave(file.path(plot_dir, paste0("KEGG_barplot_",tag,".png")),
+           barplot(kk, showCategory=15, title=paste0("KEGG (",tag,")")), width=10, height=9, dpi=300)
+  }
+  invisible(list(go=go, kegg=kk))
+}
+
+if (exists("deg_sens")) {
+  invisible(enrich_melas(deg_sens, "noMELAS"))
+  
+  has_melas_col <- "is_melas" %in% names(pheno_aligned)
+  melas_log <- if (has_melas_col) {
+    x <- pheno_aligned$is_melas
+    if (is.logical(x)) x else {
+      v <- tolower(trimws(as.character(x)))
+      v %in% c("1","true","t","yes","y")
+    }
+  } else rep(FALSE, nrow(pheno_aligned))
+  
+  
+} else if (exists("pheno_aligned") && any(melas_log, na.rm = TRUE)) {
+  
+  expr_base <- if (exists("expr_use")) expr_use else expr_cb
+  
+  keep <- !melas_log
+  expr_s <- expr_base[, keep, drop = FALSE]
+  ph_s   <- droplevels(pheno_aligned[keep, , drop = FALSE])
+  
+  if (nlevels(ph_s$group) >= 2 && all(table(ph_s$group) > 0)) {
+    design_s <- model.matrix(~ 0 + group, data = ph_s)
+    colnames(design_s) <- gsub("^group", "", colnames(design_s))  # "Control","Pompe"
     
-    # Convert to table
-    df <- data.frame(
-      miRNA = names(top_mirs),
-      Target_Count = as.numeric(top_mirs)
-    )
-    df$miRNA <- factor(df$miRNA, levels = df$miRNA[order(df$Target_Count)])
+    fit_s  <- limma::lmFit(expr_s, design_s)
+    cont_s <- limma::makeContrasts(Pompe - Control, levels = design_s)
+    fit2_s <- limma::eBayes(limma::contrasts.fit(fit_s, cont_s))
     
-    # Barplot
-    p <- ggplot(df, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
-      geom_bar(stat = "identity", width = 0.7) +
+    tt_all_s <- limma::topTable(fit2_s, coef = 1, number = Inf, adjust.method = "BH")
+  
+  
+  expr_s   <- expr_cb[, keep_idx, drop=FALSE]
+  ph_s     <- droplevels(pheno_aligned[keep_idx, ])
+  design_s <- model.matrix(~ 0 + group, data = ph_s); colnames(design_s) <- levels(ph_s$group)
+  fit_s2   <- limma::eBayes(limma::contrasts.fit(limma::lmFit(expr_s, design_s),
+                                                 limma::makeContrasts(Pompe - Control, levels = design_s)))
+
+  tt_all_s$abs_logFC <- abs(tt_all_s$logFC)
+  tt_gene_s <- tt_all_s[!is.na(tt_all_s$SYMBOL) & nzchar(tt_all_s$SYMBOL), ]
+  tt_gene_s <- tt_gene_s[order(tt_gene_s$SYMBOL, -tt_gene_s$abs_logFC), ]
+  tt_gene_s <- tt_gene_s[!duplicated(tt_gene_s$SYMBOL), ]
+  deg_sens  <- subset(tt_gene_s, adj.P.Val < FDR_THRESH)
+  write.csv(deg_sens,
+            file.path(enrich_dir,
+                      sprintf("DEG_noMELAS_FDR_lt_%s.csv", FDR_THRESH)),
+            row.names=FALSE)
+  invisible(enrich_melas(deg_sens, "noMELAS"))
+  
+} else {
+  message("MELAS hariçte iki grup kalmadı; Pompe-Control karşılaştırması atlandı.")
+  tt_all_s <- NULL
+  deg_sens <- NULL
+}
+
+sum_lines <- c(
+  sprintf("Main GO terms (q<%s): %d", FDR_THRESH, ifelse(is.null(go_bp), 0, nrow(as.data.frame(go_bp)))),
+  sprintf("Main KEGG pathways (q<%s): %d", FDR_THRESH, ifelse(is.null(kegg), 0, nrow(as.data.frame(kegg)))),
+  sprintf("Universe size: SYMBOL=%d | ENTREZ=%d", length(universe_symbols), length(entrez_universe)),
+  "Notes: BH correction everywhere; GO uses explicit universe (all tested gene-level).",
+  "Sensitivity: If MELAS present, enrichment repeated without MELAS; GSEA added to reduce threshold dependence."
+)
+writeLines(sum_lines, file.path(enrich_dir,"_ENRICHMENT_SUMMARY.txt"))
+
+# ====================       miRNA Target Enrichment (FAIR, offline)         ====================
+
+out_dir  <- file.path(root_dir, "results", "miRNA_analysis")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+set.seed(20240724)
+
+stopifnot(exists("tt_gene"), "SYMBOL" %in% names(tt_gene))
+stopifnot(exists("deg"),     "SYMBOL" %in% names(deg))
+if (nrow(deg) == 0) stop("No DEGs detected; adjust thresholds.")
+universe_symbols <- unique(tt_gene$SYMBOL[!is.na(tt_gene$SYMBOL) & nzchar(tt_gene$SYMBOL)])
+sig_genes        <- unique(deg$SYMBOL[!is.na(deg$SYMBOL) & nzchar(deg$SYMBOL)])
+
+meta <- list(
+  dataset          = "GSE38680",
+  n_control        = if (exists("groups")) sum(groups=="Control") else NA_integer_,
+  n_pompe          = if (exists("groups")) sum(groups=="Pompe") else NA_integer_,
+  n_universe_genes = length(universe_symbols),
+  n_sig_genes      = length(sig_genes),
+  fdr_threshold    = FDR_THRESH,
+  adjust_method    = "BH",
+  note_small_n     = "Small sample size; interpret enrichment cautiously."
+)
+jsonlite::write_json(meta, file.path(out_dir, "_mirna_meta.json"), pretty = TRUE)
+
+enrich_mirna <- function(gene_set, universe_set, which_table=c("validated","predicted")) {
+  which_table <- match.arg(which_table)
+  # multiMiR'den hedef map (yerel kaynaklar)
+  mm <- tryCatch(
+    multiMiR::get_multimir(org="hsa", target = universe_set, table = which_table, summary = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(mm) || nrow(mm@data)==0) return(NULL)
+  
+  df <- mm@data
+  target_col <- c("target_symbol","target.gene","target")[
+    c("target_symbol","target.gene","target") %in% names(df)][1]
+  if (is.na(target_col)) return(NULL)
+  
+  df <- df[!is.na(df[[target_col]]) & nzchar(df[[target_col]]), c("mature_mirna_id", target_col, "database")]
+  colnames(df) <- c("miRNA","SYMBOL","database")
+  
+  df <- df[df$SYMBOL %in% universe_set, , drop = FALSE]
+  if (!nrow(df)) return(NULL)
+  
+  map_list <- split(df$SYMBOL, df$miRNA)
+  res <- lapply(names(map_list), function(m) {
+    tgt <- unique(map_list[[m]])
+    a <- length(intersect(tgt, gene_set))
+    b <- length(setdiff(tgt, gene_set))
+    c <- length(setdiff(gene_set, tgt))
+    d <- length(setdiff(universe_set, union(tgt, gene_set)))
+    if ((a+b)==0 || (c+d)==0) return(NULL)
+    ft <- suppressWarnings(fisher.test(matrix(c(a,b,c,d), nrow=2), alternative="greater"))
+    data.frame(miRNA=m, a=a, b=b, c=c, d=d, p.value=ft$p.value, targets_in_deg=a,
+               targets_total=a+b, stringsAsFactors = FALSE)
+  })
+  res <- dplyr::bind_rows(res)
+  if (is.null(res) || !nrow(res)) return(NULL)
+  res$FDR <- p.adjust(res$p.value, method="BH")
+  res$method <- which_table
+  res <- res[order(res$FDR, -res$targets_in_deg), ]
+  res
+}
+
+tab_val <- enrich_mirna(sig_genes, universe_symbols, "validated")
+tab_pre <- enrich_mirna(sig_genes, universe_symbols, "predicted")
+enr_main <- dplyr::bind_rows(tab_val, tab_pre)
+if (!is.null(enr_main) && nrow(enr_main)) {
+  write.csv(enr_main, file.path(out_dir,"miRNA_enrichment_main.csv"), row.names = FALSE)
+  top15 <- head(enr_main[order(enr_main$FDR, -enr_main$targets_in_deg), ], 15)
+  if (nrow(top15)) {
+    p <- ggplot(top15, aes(x=reorder(miRNA, -log10(FDR)), y=-log10(FDR), fill=method)) +
+      geom_col() +
       coord_flip() +
-      scale_fill_gradient(low = "#FFBABA", high = "#B22222") +
-      theme_minimal(base_size = 14) +
-      labs(title = paste(db, "Top miRNA Target Count"),
-           x = "miRNA",
-           y = "Number of Validated Targets",
-           fill = "Target Count")
-    
-    print(p)
+      labs(title = "miRNA Target Enrichment (BH, universe = all tested genes)",
+           x = "miRNA", y = expression(-log[10]*"FDR")) +
+      theme_minimal(base_size = 12)
+    ggsave(file.path(out_dir,"miRNA_enrichment_top15.png"), p, width=8, height=6, dpi=300)
   }
-  
 } else {
-  cat("Could not retrieve data from multiMiR query.\n")
+  message("miRNA enrichment: no signal (check DEG size / universe).")
 }
 
-################################################################################ 
-
-
-if (!require("multiMiR", quietly = TRUE)) BiocManager::install("multiMiR")
-library(multiMiR)
-
-test_genes <- head(significant_genes, 10)
-
-mm_pred <- tryCatch({
-  get_multimir(
-    org = "hsa",
-    target = test_genes,
-    table = "predicted",    # predicted database!
-    summary = TRUE
+if (!is.null(tab_val) && nrow(tab_val)) {
+  best <- head(tab_val$miRNA[order(tab_val$FDR)], 5)
+  mm_net <- tryCatch(
+    multiMiR::get_multimir(org="hsa", target = sig_genes, table = "validated", summary = FALSE),
+    error = function(e) NULL
   )
-}, error = function(e) {
-  message("Query error: ", e$message)
-  return(NULL)
-})
-
-if (!is.null(mm_pred)) {
-  print(unique(mm_pred@data$database))
-  print(head(mm_pred@data, 10))
-  
-  db_counts <- table(mm_pred@data$database)
-  print(db_counts)
-  
-  # Barplot: Number of targets from each database
-  barplot(db_counts,
-          col = "cornflowerblue",
-          main = "multiMiR: Predicted Database Counts",
-          xlab = "Database",
-          ylab = "Number of Targets",
-          las = 2, cex.names = 0.9)
-  
-  # You can also show the most targeted miRNAs:
-  
-  mmr_sum <- with(mm_pred@data, tapply(type, mature_mirna_id, length))
-  top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-  barplot(top_mmrs,
-          las = 2,
-          col = "darkblue",
-          main = "Predicted: Top miRNA Target Count",
-          ylab = "Target Count")
-  
-} else {
-  cat("Data could not be retrieved from databases predicted with multiMiR.\n")
-}
-
-###############################################################################
-
-library(ggplot2)
-df_pred <- data.frame(
-  miRNA = names(top_mmrs),
-  Target_Count = as.numeric(top_mmrs)
-)
-ggplot(df_pred, aes(x = miRNA, y = Target_Count, fill = Target_Count)) +
-  geom_bar(stat = "identity", width = 0.7) +
-  coord_flip() +
-  scale_fill_gradient(low = "#9BD6FF", high = "#03396C") +
-  theme_minimal(base_size = 14) +
-  labs(title = "Predicted: Top miRNA Target Count",
-       x = "miRNA",
-       y = "Number of Predicted Targets",
-       fill = "Target Count")
-
-################################################################################
-
-if (!require("multiMiR", quietly=TRUE)) BiocManager::install("multiMiR")
-library(multiMiR)
-library(ggplot2)
-library(dplyr)
-
-dbs <- c("targetscan", "mirdb", "miranda", "pita", "pictar",
-         "micrornaorg", "diana_microt", "mirbridge", "elmmmo", "pharcomir")
-
-test_genes <- head(significant_genes, 10) 
-
-df_list <- list()
-for (db in dbs) {
-  mm_db <- tryCatch({
-    get_multimir(
-      org = "hsa",
-      target = test_genes,
-      table = "predicted",   # predicted database search!
-      summary = TRUE
-    )
-  }, error = function(e) return(NULL))
-  
-  if (!is.null(mm_db)) {
-    db_data <- subset(mm_db@data, database == db)
-    if (nrow(db_data) > 0) {
-      mmr_sum <- with(db_data, tapply(type, mature_mirna_id, length))
-      top_mmrs <- head(sort(mmr_sum, decreasing = TRUE), 10)
-      df_tmp <- data.frame(
-        miRNA = names(top_mmrs),
-        Target_Count = as.numeric(top_mmrs),
-        Database = db
-      )
-      df_list[[db]] <- df_tmp
+  if (!is.null(mm_net) && nrow(mm_net@data)) {
+    df <- mm_net@data
+    target_col <- c("target_symbol","target.gene","target")[
+      c("target_symbol","target.gene","target") %in% names(df)][1]
+    if (!is.na(target_col)) {
+      net <- df[df$mature_mirna_id %in% best & df[[target_col]] %in% sig_genes,
+                c("mature_mirna_id", target_col, "database")]
+      colnames(net) <- c("miRNA","SYMBOL","database")
+      if (nrow(net)) write.csv(net, file.path(out_dir,"network_top5_miRNA_to_DEG.csv"), row.names = FALSE)
     }
   }
 }
 
-df_all <- bind_rows(df_list)
+sig_genes_s <- NULL
+if (exists("pheno_aligned") && (("is_melas" %in% names(pheno_aligned)) || ("specialcase" %in% names(pheno_aligned)))) {
+  mel_flag <- if ("is_melas" %in% names(pheno_aligned)) pheno_aligned$is_melas else pheno_aligned$specialcase
+  mel_flag <- tolower(as.character(mel_flag)) %in% c("1","true","t","yes","y")
+  if (any(mel_flag)) {
+    if (exists("deg_sens") && "SYMBOL" %in% names(deg_sens)) {
+      sig_genes_s <- unique(deg_sens$SYMBOL)
+    } else if (exists("expr_cb")) {
+      keep_idx <- which(!mel_flag)
+      if (length(keep_idx) >= 4) {
+        expr_s <- expr_cb[, keep_idx, drop=FALSE]
+        ph_s   <- droplevels(pheno_aligned[keep_idx, ])
+        des_s  <- model.matrix(~ 0 + group, data = transform(ph_s, group=factor(group, levels=c("Control","Pompe"))))
+        colnames(des_s) <- levels(factor(ph_s$group, levels=c("Control","Pompe")))
+        fit_s  <- limma::lmFit(expr_s, des_s)
+        cont_s <- limma::makeContrasts(Pompe - Control, levels = des_s)
+        fit_s2 <- limma::eBayes(limma::contrasts.fit(fit_s, cont_s))
+        tt_s   <- limma::topTable(fit_s2, number=Inf, adjust.method="BH")
+        tt_s$SYMBOL <- tt_s$SYMBOL %||% NA_character_
+        if (!"SYMBOL" %in% names(tt_s)) {
+        }
+        if ("SYMBOL" %in% names(tt_s)) {
+          tt_s$abs_logFC <- abs(tt_s$logFC)
+          tt_sg <- tt_s[!is.na(tt_s$SYMBOL) & nzchar(tt_s$SYMBOL), ]
+          tt_sg <- tt_sg[order(tt_sg$SYMBOL, -tt_sg$abs_logFC), ]
+          tt_sg <- tt_sg[!duplicated(tt_sg$SYMBOL), ]
+          sig_genes_s <- unique(tt_sg$SYMBOL[tt_sg$adj.P.Val < FDR_THRESH])
+        }
+      }
+    }
+  }
+}
+`%||%` <- function(x, y) if (is.null(x)) y else x
 
-ggplot(df_all, aes(x = miRNA, y = Target_Count, fill = Database)) +
-  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
-  labs(title = "Top miRNAs by Predicted Database (multiMiR)", 
-       x = "miRNA", y = "Number of Predicted Targets") +
-  theme_minimal(base_size = 10) +
-  coord_flip() +
-  theme(axis.text.y = element_text(size = 7))
+if (!is.null(sig_genes_s) && length(sig_genes_s)) {
+  tab_val_s <- enrich_mirna(sig_genes_s, universe_symbols, "validated")
+  tab_pre_s <- enrich_mirna(sig_genes_s, universe_symbols, "predicted")
+  enr_sens  <- dplyr::bind_rows(tab_val_s, tab_pre_s)
+  if (!is.null(enr_sens) && nrow(enr_sens)) {
+    write.csv(enr_sens, file.path(out_dir,"miRNA_enrichment_noMELAS.csv"), row.names = FALSE)
 
-###############################################################################
+    top_main <- head(enr_main$miRNA[order(enr_main$FDR)], 10)
+    top_sens <- head(enr_sens$miRNA[order(enr_sens$FDR)], 10)
+    ovlp     <- intersect(top_main, top_sens)
+    writeLines(c(
+      sprintf("Top10 overlap (validated+predicted): %d", length(ovlp)),
+      paste("Common:", paste(ovlp, collapse=", "))
+    ), file.path(out_dir,"_sensitivity_overlap.txt"))
+  }
+}
 
-# 8b. UMAP and quality control charts
+writeLines(c(capture.output(sessionInfo())), file.path(out_dir,"session_info.txt"))
 
-install.packages(c("umap", "ggplot2", "ggrepel"))
-library(umap)
+message("miRNA enrichment (FAIR/offline) tamamlandı. Çıktılar: ", out_dir)
 
-# 1. Remove missing (NA) and duplicate rows
-expr2 <- na.omit(expr_matrix)                  # Remove gene/probe rows that are NA
-expr2 <- expr2[!duplicated(rownames(expr2)), ] # Remove duplicate rows
+# ===================    MELAS SENSITIVITY VIS (opsiyonel; FAIR) GÖRSELLEŞTİRMYÖNE AL  ===================
 
-# 2. UMAP Analysis (if rows are gene/probe and columns are samples, transpose!)
-ump <- umap(t(expr2), n_neighbors = 8, random_state = 123)
+has_melas <- "is_melas" %in% names(pheno_aligned) && any(pheno_aligned$is_melas)
+if (has_melas) {
+  keep_idx <- which(!pheno_aligned$is_melas)
+  if (length(keep_idx) >= 4) {  # küçük n koruması
+    expr_sens <- expr_use[, keep_idx, drop = FALSE]
+    ph_sens   <- droplevels(pheno_aligned[keep_idx, ])
+    des_s     <- model.matrix(~0 + group, data = ph_sens)
+    colnames(des_s) <- levels(ph_sens$group)
+    
+    fit_s  <- limma::lmFit(expr_sens, des_s)
+    cont_s <- limma::makeContrasts(Pompe - Control, levels = des_s)
+    fit_s2 <- limma::eBayes(limma::contrasts.fit(fit_s, cont_s))
+    
+    tt_all_s <- limma::topTable(fit_s2, coef = 1, number = Inf, adjust.method = "BH")
+    stopifnot("SYMBOL" %in% names(tt_all)) # ana tabloda anotasyon vardı
+    ann_s <- AnnotationDbi::select(hgu133plus2.db,
+                                   keys = rownames(tt_all_s),
+                                   columns = c("SYMBOL"),
+                                   keytype = "PROBEID")
+    tt_all_s$SYMBOL <- ann_s$SYMBOL[match(rownames(tt_all_s), ann_s$PROBEID)]
+    tt_all_s$abs_logFC <- abs(tt_all_s$logFC)
+    tt_gene_s <- tt_all_s[!is.na(tt_all_s$SYMBOL) & nzchar(tt_all_s$SYMBOL), ]
+    tt_gene_s <- tt_gene_s[order(tt_gene_s$SYMBOL, -tt_gene_s$abs_logFC), ]
+    tt_gene_s <- tt_gene_s[!duplicated(tt_gene_s$SYMBOL), ]
+    deg_sens  <- subset(tt_gene_s, adj.P.Val < FDR_THRESH)
+    
+    volc_sens <- ggplot(tt_gene_s, aes(logFC, -log10(adj.P.Val))) +
+      geom_point(aes(color = adj.P.Val < FDR_THRESH), alpha = 0.75, size = 1.6) +
+      geom_vline(xintercept = c(-LOGFC_THRESH, LOGFC_THRESH), lty = "dashed", color = "grey50") +
+      geom_hline(yintercept = -log10(FDR_THRESH), lty = "dashed", color = "grey50") +
+      scale_color_manual(values = c("grey70","steelblue")) +
+      labs(title = "Volcano (No‑MELAS; BH‑FDR; gene‑level)",
+           x = expression(log[2]*"FC"), y = expression(-log[10]*"FDR"), color = NULL) +
+      theme_bw(base_size = 12)
+    
+    ggsave(file.path(plots_dir, sprintf("volcano_FDR%s_geneLevel_noMELAS.png", FDR_THRESH)),
+           volc_sens, width = 8, height = 6, dpi = 300)
+    
+    ov   <- length(intersect(deg$SYMBOL, deg_sens$SYMBOL))
+    msg  <- sprintf("MELAS dahil DEG: %d | MELAS hariç DEG: %d | ortak: %d",
+                    nrow(deg), nrow(deg_sens), ov)
+    writeLines(msg, file.path(root_dir,"results","deg","MELAS_sensitivity_summary.txt"))
+    message("[MELAS] ", msg)
+  } else {
+    message("[MELAS] Hariç sonrası örnek sayısı çok az; duyarlılık görselleri atlandı.")
+  }
+}
 
-# (e.g., if you have a group vector)
-gs <- as.factor(groups)
+# ======================        miRNA VIS (multiMiR; FAIR; ayrı DB'ler)       ======================
 
-plot(ump$layout,
-     main = "UMAP plot (n_neighbors=8)",
-     xlab = "UMAP1", ylab = "UMAP2",
-     col = gs, pch = 20, cex = 1.5)
-legend("topright", legend = levels(gs), col = 1:length(levels(gs)), pch = 20)
+mir_dir <- file.path(root_dir, "results", "miRNA_analysis")
+dir.create(mir_dir, recursive = TRUE, showWarnings = FALSE)
 
-# sample names: rownames(ump$layout)
-ump_df <- data.frame(
-  Sample = rownames(ump$layout),
-  UMAP1 = ump$layout[,1],
-  UMAP2 = ump$layout[,2],
-  Group = as.factor(gs)   # your group vector should be here!
-)
+writeLines("WARNING: small sample size (9 Pompe vs 10 Control). Interpret with caution.",
+           file.path(mir_dir, "_NOTE_small_n.txt"))
 
-plot(ump$layout,
-     main = "UMAP plot (n_neighbors=8)",
-     xlab = "UMAP1", ylab = "UMAP2",
-     col = gs, pch = 20, cex = 1.5)
-legend("topright", legend = levels(gs), col = 1:length(levels(gs)), pch = 20)
-
-##############################################################################
-
-library(ggplot2)
-library(ggrepel)
-
-# Trim GSM names (Sample_clean)
-ump_df$Sample_clean <- gsub("_.*\\.CEL$", "", ump_df$Sample)
-
-ggplot(ump_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
-  geom_point(size = 3) +
-  ggrepel::geom_text_repel(aes(label = Sample_clean), size = 3, max.overlaps = 15) +
-  labs(title = "UMAP plot (n_neighbors = 8)",
-       x = "UMAP1", y = "UMAP2") +
-  theme_minimal(base_size = 15) +
-  theme(
-    legend.position = "right",
-    plot.title = element_text(face = "bold", size = 16),
-    axis.text = element_text(size = 13)
+sig_syms <- if (exists("deg")) head(unique(deg$SYMBOL), 50) else character(0)
+if (length(sig_syms) < 2) {
+  message("[miRNA] Yeterli anlamlı gen yok; multiMiR adımları atlandı.")
+} else {
+          
+    mm_val <- multiMiR::get_multimir(org = "hsa",
+                                     target = sig_syms,
+                                     table = "validated",
+                                     summary = FALSE)
+    
+        class(mm_val); isS4(mm_val); slotNames(mm_val)
+    
+    mm_to_df <- function(x) {
+      if (is.null(x)) return(NULL)
+      if (isS4(x) && "data" %in% slotNames(x)) as.data.frame(x@data) else
+        if (is.data.frame(x)) x else NULL
+    }
+      
+    dfv <- mm_val@data
+    if ("p.value" %in% names(dfv)) {
+      dfv$FDR <- p.adjust(dfv$p.value, method = "BH")
+    
+    pltv <- dfv |>
+      dplyr::count(database, mature_mirna_id, name="Target_Count") |>
+      dplyr::group_by(database) |>
+      dplyr::slice_max(Target_Count, n = 10, with_ties = FALSE) |>
+      dplyr::ungroup()
+    
+    p_val <- ggplot(pltv, aes(x = mature_mirna_id, y = Target_Count, fill = database)) +
+      geom_bar(stat="identity", position = position_dodge(width=.7), width=.6) +
+      coord_flip() + theme_minimal(base_size = 12) +
+      labs(title="Validated miRNA Targets (multiMiR; BH‑FDR applied)",
+           x="miRNA", y="Target count", fill="DB")
+    ggsave(file.path(mir_dir, "Validated_miRNA_targets.png"), p_val, width=8, height=6, dpi=300)
+    write.csv(dfv, file.path(mir_dir, "validated_full_with_FDR.csv"), row.names = FALSE)
+    }  
+    else {
+      message("[miRNA] Validated sonuç yok ya da erişilemedi.")
+    }
+    
+  mm_pred <- tryCatch(
+    multiMiR::get_multimir(org="hsa", target=sig_syms, table="predicted", summary=TRUE),
+    error = function(e) NULL
   )
+  if (!is.null(mm_pred) && nrow(mm_pred@data) > 0) {
+    dfp <- mm_pred@data
+   dfp$FDR <- p.adjust(dfp&p_value, method = "BH")
+    
+    pltp <- dfp |>
+      dplyr::count(database, mature_mirna_id, name="Target_Count") |>
+      dplyr::group_by(database) |>
+      dplyr::slice_max(Target_Count, n = 10, with_ties = FALSE) |>
+      dplyr::ungroup()
+    
+    p_pred <- ggplot(pltp, aes(x = mature_mirna_id, y = Target_Count, fill = database)) +
+      geom_bar(stat="identity", position=position_dodge(width=.7), width=.6) +
+      coord_flip() + theme_minimal(base_size = 12) +
+      labs(title="Predicted miRNA Targets (multiMiR; BH‑FDR applied)",
+           x="miRNA", y="Target count", fill="DB")
+    ggsave(file.path(mir_dir, "Predicted_miRNA_targets.png"), p_pred, width=8, height=6, dpi=300)
+    write.csv(dfp, file.path(mir_dir, "predicted_full_with_FDR.csv"), row.names = FALSE)
+  } else {
+    message("[miRNA] Predicted sonuç yok ya da erişilemedi.")
+  }
+}
+
+expr2 <- na.omit(expr_use)
+expr2 <- expr2[!duplicated(rownames(expr2)), ]
+set.seed(123)
+um <- umap::umap(t(expr2), n_neighbors = 8, random_state = 123)
+ump_df <- data.frame(Sample = rownames(um$layout),
+                     UMAP1 = um$layout[,1], UMAP2 = um$layout[,2],
+                     Group = groups)
+p_umap <- ggplot(ump_df, aes(UMAP1, UMAP2, color = Group, label = Sample)) +
+  geom_point(size=3) + ggrepel::geom_text_repel(size=3, max.overlaps = 15) +
+  theme_minimal(base_size = 13) + labs(title="UMAP QC (batch/SVA sonrası ifade)")
+ggsave(file.path(mir_dir, "QC_UMAP.png"), p_umap, width=7, height=5, dpi=300)
+
+meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
+                 n_control=sum(groups=="Control"), adj="BH",
+                 note_small_n=TRUE, date=as.character(Sys.Date()))
+jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
