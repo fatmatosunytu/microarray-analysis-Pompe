@@ -67,14 +67,12 @@ LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
     metadata_url <- "https://example.com/pheno.csv"  # replace with actual download link
     dir.create(dirname(doc_file), recursive = TRUE, showWarnings = FALSE)
     utils::download.file(metadata_url, doc_file, mode = "wb")
+  } else {
+    stop("pheno.csv not found. Ensure metadata is downloaded via Git LFS to ~/Documents.")
   }
   file.copy(doc_file, file.path(meta_dir, "pheno.csv"), overwrite = TRUE)
   pheno <- data.table::fread(file.path(meta_dir, "pheno.csv"),
                              na.strings = c("", "NA", "NaN"))
-    } else {
-      stop("pheno.csv not found. Ensure metadata is downloaded via Git LFS to ~/Documents.")
-    }
-  }
 
 pheno$filename <- basename(trimws(pheno$filename))
 cel_dir   <- meta_dir
@@ -1204,6 +1202,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
