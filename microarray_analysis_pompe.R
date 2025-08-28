@@ -14,7 +14,7 @@ packages <- c(␊
   "affy", "annotate", "clusterProfiler", "data.table", "dplyr", "enrichplot",␊
   "genefilter", "ggplot2", "ggrepel", "grid", "gridExtra", "hgu133plus2.db",␊
   "jsonlite", "limma", "msigdbr", "multiMiR", "org.Hs.eg.db", "pheatmap",␊
-  "sva", "umap", "STRINGdb", "rDGIdb", "igraph", "ggraph", "rDGIdb", "tidygraph"
+  "sva", "umap", "STRINGdb", "rDGIdb", "igraph", "ggraph", "tidygraph"
 )␊
 
 #------------------------   Load required packages; assumes they are already installed   ----------------------
@@ -1204,6 +1204,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
