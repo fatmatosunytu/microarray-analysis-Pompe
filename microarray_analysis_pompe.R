@@ -19,9 +19,9 @@ packages <- c(␊
 
 #------------------------   Load required packages; assumes they are already installed   ----------------------
 
-invisible(lapply(packages, library, character.only = TRUE))
-
-  align_samples <- function(cel_files, pheno) {
+invisible(lapply(packages, library, character.only = TRUE))␊
+␊
+  align_samples <- function(cel_files, pheno) {␊
    sample_names <- basename(cel_files)
    pheno_df <- as.data.frame(pheno, stringsAsFactors = FALSE)
    pheno_keys <- toupper(basename(trimws(pheno_df$filename)))
@@ -37,6 +37,24 @@ invisible(lapply(packages, library, character.only = TRUE))
    stopifnot(identical(rownames(aligned), sample_names))
    aligned
  }
+
+  run_string_ppi <- function(deg, root_dir) {
+    if (nrow(deg) <= 1) return(invisible(NULL))
+    try({
+      string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+      mapped_deg <- string_db$map(deg, "SYMBOL", removeUnmappedRows = TRUE)
+      if (nrow(mapped_deg) > 1) {
+        hits <- mapped_deg$STRING_id
+        ppi_dir <- file.path(root_dir, "results", "ppi")
+        dir.create(ppi_dir, recursive = TRUE, showWarnings = FALSE)
+        png(file.path(ppi_dir, "string_network.png"), width = 800, height = 600)
+        string_db$plot_network(hits)
+        dev.off()
+        ppi_edges <- string_db$get_interactions(hits)
+        write.csv(ppi_edges, file.path(ppi_dir, "string_interactions.csv"), row.names = FALSE)
+      }
+    }, silent = TRUE)
+  }
 
 pkgbuild::has_build_tools(debug = TRUE)
 
@@ -257,6 +275,9 @@ write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
 write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
 
 # ===================== PPI analysis via STRINGdb =====================
+
+run_string_ppi(deg, root_dir)
+
 ppi_dir <- file.path(root_dir, "results", "ppi")
 dir.create(ppi_dir, recursive = TRUE, showWarnings = FALSE)
 deg_for_ppi <- if (exists("melas_res") && !is.null(melas_res$deg_noM_sig)) melas_res$deg_noM_sig else deg
@@ -1042,7 +1063,7 @@ if (has_melas) {
            x = expression(log[2]*"FC"), y = expression(-log[10]*"FDR"), color = NULL) +
       theme_bw(base_size = 12)
     
-    ggsave(file.path(plots_dir, sprintf("volcano_FDR%s_geneLevel_noMELAS.png", FDR_THRESH)),
+    ggsave(file.path(plot_dir, sprintf("volcano_FDR%s_geneLevel_noMELAS.png", FDR_THRESH)),
            volc_sens, width = 8, height = 6, dpi = 300)
     
     ov   <- length(intersect(deg$SYMBOL, deg_sens$SYMBOL))
@@ -1176,3 +1197,4 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
