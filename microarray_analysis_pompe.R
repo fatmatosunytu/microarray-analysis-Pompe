@@ -438,11 +438,11 @@ run_deg_analysis <- function(expr, pheno, run_melas = FALSE,
 
 melas_res <- prepare_melas(pheno_aligned, expr_cb, file.path(root_dir, "results", "deg"))
 
-plot_dir <- file.path(root_dir, "results", "plots")
-dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
-
+plot_dir <- file.path(root_dir, "results", "plots")␊
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)␊
+␊
 expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f  # batch/SVA sonrası
-stopifnot(ncol(expr_plot) == nrow(pheno_aligned))
+stopifnot(ncol(expr_plot) == nrow(pheno_aligned))␊
 
 stopifnot(exists("tt_all"), exists("tt_gene"), exists("deg"))
 
@@ -1192,5 +1192,6 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
