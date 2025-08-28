@@ -255,7 +255,6 @@ down_n <- sum(deg$logFC < 0, na.rm = TRUE)
 
 write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
 write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
-write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
 
 # ===================== PPI analysis via STRINGdb =====================
 ppi_dir <- file.path(root_dir, "results", "ppi")
@@ -651,6 +650,7 @@ if (nrow(as.data.frame(gsea_go)) > 0) {
   }
 }
 
+sym2ent <- bitr(tt_gene$SYMBOL, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
 sym2ent <- sym2ent[!is.na(sym2ent$ENTREZID) & nzchar(sym2ent$SYMBOL), ]
 sym2ent$abs_rank <- abs(ranks[sym2ent$SYMBOL])
 sym2ent <- sym2ent[order(sym2ent$abs_rank, decreasing = TRUE), ]
@@ -1202,6 +1202,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
