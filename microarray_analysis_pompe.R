@@ -14,7 +14,7 @@ packages <- c(␊
   "affy", "annotate", "clusterProfiler", "data.table", "dplyr", "enrichplot",␊
   "genefilter", "ggplot2", "ggrepel", "grid", "gridExtra", "hgu133plus2.db",␊
   "jsonlite", "limma", "msigdbr", "multiMiR", "org.Hs.eg.db", "pheatmap",␊
-  "sva", "umap", "STRINGdb", "rDGIdb"
+  "sva", "umap", "STRINGdb", "rDGIdb", "igraph", "ggraph", "rDGIdb", "tidygraph"
 )␊
 
 #------------------------   Load required packages; assumes they are already installed   ----------------------
@@ -47,14 +47,10 @@ LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
 #-----------------------------   Load CEL files and normalize with RMA    ---------------------------------------------
 
   root_dir <- normalizePath(Sys.getenv("POMPE_ROOT", getwd()), winslash = "/")
-  doc_dir  <- path.expand(file.path("~", "Documents"))
-  meta_candidates <- c(file.path(root_dir, "metadata", "pheno.csv"),
-                       file.path(doc_dir, "pheno.csv"))
-  meta_file <- meta_candidates[file.exists(meta_candidates)][1]
-  if (is.na(meta_file)) {
-    stop("pheno.csv not found in metadata/ or Documents. Run 'git lfs pull' to download the metadata.")
-  }
-  meta_dir <- dirname(meta_file)
+  dir.create(file.path(root_dir, "metadata"), showWarnings = FALSE, recursive = TRUE)␊
+  meta_dir <- file.path(root_dir, "metadata")␊
+␊
+  stopifnot(dir.exists(meta_dir))␊
 
   dir.create(file.path(root_dir, "results", "qc"),    recursive = TRUE, showWarnings = FALSE)
   dir.create(file.path(root_dir, "results", "deg"),   recursive = TRUE, showWarnings = FALSE)
@@ -66,6 +62,15 @@ LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
 
   set.seed(20240724)
 
+  doc_file  <- file.path(path.expand("~/Documents"), "pheno.csv")
+  meta_file <- file.path(meta_dir, "pheno.csv")
+  if (!file.exists(meta_file)) {
+    if (file.exists(doc_file)) {
+      file.copy(doc_file, meta_file, overwrite = TRUE)
+    } else {
+      stop("pheno.csv not found. Ensure metadata is downloaded via Git LFS to ~/Documents.")
+    }
+  }
   pheno <- data.table::fread(meta_file, na.strings = c("", "NA", "NaN"))
 
 pheno$filename <- basename(trimws(pheno$filename))
@@ -144,9 +149,6 @@ ggplot2::ggsave(file.path(root_dir,"results","qc","pca_groups_batches.png"), gg,
 #========================== Identify differentially expressed genes with limma ===================================
 
 expr_cb <- if (exists("expr_f")) expr_f else expr
-stopifnot(is.matrix(expr_cb))
-stopifnot(exists("design"))
-stopifnot(ncol(expr_cb) == nrow(design))
 stopifnot(exists("pheno_aligned"))
 groups <- factor(pheno_aligned$group, levels = c("Control","Pompe"))
 
@@ -250,6 +252,34 @@ down_n <- sum(deg$logFC < 0, na.rm = TRUE)
 write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
 write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
 write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
+
+deg_for_ppi <- if (exists("melas_res") && !is.null(melas_res$deg_noM_sig)) melas_res$deg_noM_sig else deg
+
+if (nrow(deg_for_ppi) > 0) {
+  try({
+    string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+    deg_mapped <- string_db$map(deg_for_ppi, "ENTREZID", removeUnmappedRows = TRUE)
+    inter <- string_db$get_interactions(deg_mapped$STRING_id)
+    if (nrow(inter) > 0) {
+      g_ppi <- igraph::graph_from_data_frame(inter, directed = FALSE)
+      plt_ppi <- ggraph::ggraph(g_ppi, layout = "fr") +
+        ggraph::geom_edge_link(alpha = 0.3) +
+        ggraph::geom_node_point(color = "steelblue", size = 3) +
+        ggraph::theme_void()
+      ggsave(file.path(root_dir, "results", "plots", "ppi_network.png"), plt_ppi,
+             width = 8, height = 6, dpi = 300)
+    }
+  }, silent = TRUE)
+
+  try({
+    mir_dir <- file.path(root_dir, "results", "miRNA_analysis")
+    mir_hits <- multiMiR::get_multimir(target = rownames(deg_for_ppi), table = "validated")
+    genes <- unique(mir_hits@data$target_symbol)
+    drug_res <- rDGIdb::queryDGIdb(genes)
+    write.csv(drug_res$matchedTerms,
+              file.path(mir_dir, "drug_candidates.csv"), row.names = FALSE)
+  }, silent = TRUE)
+}
 
 #======================= Protein-protein interaction network (STRINGdb) =======================
 if (nrow(deg) > 0) {
@@ -371,9 +401,10 @@ run_deg_analysis <- function(expr, pheno, run_melas = FALSE,
   cont_cov <- limma::makeContrasts(Pompe - Control, levels = design_cov)
   fit2_cov <- limma::eBayes(limma::contrasts.fit(fit_cov, cont_cov))
   cov_res  <- limma::topTable(fit2_cov, coef = 1, number = Inf, adjust.method = "BH")
-  out <- list(deg_cov = cov_res,
-              deg_cov_sig = subset(cov_res, adj.P.Val < fdr_threshold & abs(logFC) >= lfc_threshold))
-  if (run_melas) {
+  out <- list(deg_cov = cov_res,␊
+              deg_cov_sig = subset(cov_res, adj.P.Val < fdr_threshold & abs(logFC) >= lfc_threshold))␊
+  if (run_melas) {␊
+    keep_idx <- which(
     keep_idx <- which(pheno$is_melas == "No")
     expr_noM <- expr[, keep_idx, drop = FALSE]
     ph_noM   <- droplevels(pheno[keep_idx, ])
@@ -389,6 +420,8 @@ run_deg_analysis <- function(expr, pheno, run_melas = FALSE,
   }
   out
 }
+
+melas_res <- prepare_melas(pheno_aligned, expr_cb, file.path(root_dir, "results", "deg"))
 
 plot_dir <- file.path(root_dir, "results", "plots")
 dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
@@ -1131,4 +1164,5 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
