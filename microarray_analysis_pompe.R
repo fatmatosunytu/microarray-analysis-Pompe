@@ -441,7 +441,7 @@ melas_res <- prepare_melas(pheno_aligned, expr_cb, file.path(root_dir, "results"
 plot_dir <- file.path(root_dir, "results", "plots")
 dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
 
-expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f
+expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f  # batch/SVA sonrası
 stopifnot(ncol(expr_plot) == nrow(pheno_aligned))
 
 stopifnot(exists("tt_all"), exists("tt_gene"), exists("deg"))
@@ -495,13 +495,8 @@ if (exists("tt_all_s") && exists("deg_sens")) {
   ggsave(file.path(plot_dir, "volcano_noMELAS_main.png"), p_s, width = 8, height = 6, dpi = 300)
 }
 
-
-expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f  # batch/SVA sonrası
-
 stopifnot(exists("tt_gene"), exists("deg"))
 stopifnot(nrow(deg) > 0)
-
-expr_plot <- if (exists("expr_use")) expr_use else if (exists("expr_cb")) expr_cb else expr_f
 
 TOP_N <- min(50, nrow(deg))
 stopifnot(TOP_N >= 1)
@@ -1197,4 +1192,5 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
