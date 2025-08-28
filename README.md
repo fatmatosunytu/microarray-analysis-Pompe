@@ -24,31 +24,23 @@ A comprehensive R pipeline for normalization, differential expression analysis, 
 
 ## Getting Started
 
-1. **Clone the repository**
-   ```bash
-   git clone <repo-url>
-   cd microarray-analysis-Pompe
-   ```
-2. **Install Git LFS and fetch metadata**
+1. Install [Git LFS](https://git-lfs.com/) and track the metadata file:
    ```bash
    git lfs install
-   git lfs pull --include="pheno.csv"
+   git lfs track "metadata/pheno.csv"
+   git add .gitattributes metadata/pheno.csv
+   git commit -m "Add pheno metadata"
    ```
-   The large `pheno.csv` will be downloaded to your `~/Documents` folder.
-3. **Prepare CEL files**
-   Place all CEL files referenced in `pheno.csv` in the same `~/Documents` directory.
-4. **Install R dependencies** (R ≥4.5.1)
+2. The analysis script expects `pheno.csv` in your `Documents` folder. If it is
+   absent, the script will download it using the URL defined inside
+   `microarray_analysis_pompe.R`.
+3. Place raw CEL files in `metadata/` (or update `cel_dir` in the script).
+4. Run `microarray_analysis_pompe.R` in R with the repository root as the working directory:
    ```r
-   packages <- c("affy","limma","Biobase","hgu133plus2.db","clusterProfiler",
-                 "org.Hs.eg.db","enrichplot","DOSE","GOSemSim","pheatmap",
-                 "multiMiR","STRINGdb","rDGIdb","ggplot2")
-   BiocManager::install(packages)
+   source("microarray_analysis_pompe.R")
    ```
-5. **Run the analysis**
-   ```bash
-   Rscript microarray_analysis_pompe.R
-   ```
-   Results and figures will be written to the `results/` folder.
+5. Results, figures, PPI networks and drug‑discovery tables will be written to
+   the `results/` directory tree.
 
 ## Notes
 
