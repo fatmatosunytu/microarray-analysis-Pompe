@@ -1112,9 +1112,11 @@ if (length(sig_syms) < 2) {
     }
       
     dfv <- mm_val@data
-    if ("p.value" %in% names(dfv)) {
-      dfv$FDR <- p.adjust(dfv$p.value, method = "BH")
-    
+    pcol_v <- intersect(c("p.value","p_value"), names(dfv))[1]
+    if (!is.na(pcol_v)) {
+      dfv$FDR <- p.adjust(dfv[[pcol_v]], method = "BH")
+    }
+
     pltv <- dfv |>
       dplyr::count(database, mature_mirna_id, name="Target_Count") |>
       dplyr::group_by(database) |>
@@ -1157,6 +1159,21 @@ if (length(sig_syms) < 2) {
   } else {
     message("[miRNA] Predicted sonuç yok ya da erişilemedi.")
   }
+
+  # ==================== Drug discovery from miRNA targets ====================
+  gene_targets <- unique(c(
+    if (exists("dfv") && "target_symbol" %in% names(dfv)) dfv$target_symbol else character(),
+    if (exists("dfp") && "target_symbol" %in% names(dfp)) dfp$target_symbol else character()
+  ))
+  if (length(gene_targets) > 0) {
+    drug_dir <- file.path(mir_dir, "drug_discovery")
+    dir.create(drug_dir, recursive = TRUE, showWarnings = FALSE)
+    try({
+      dg <- rDGIdb::queryDGIdb(gene_targets)
+      drug_tbl <- as.data.frame(dg@matches)
+      write.csv(drug_tbl, file.path(drug_dir, "candidate_drugs.csv"), row.names = FALSE)
+    }, silent = TRUE)
+  }
 }
 
 #================= Drug discovery for miRNA targets (rDGIdb) ==================
@@ -1187,6 +1204,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
