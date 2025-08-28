@@ -256,38 +256,28 @@ down_n <- sum(deg$logFC < 0, na.rm = TRUE)
 write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
 write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
 
+write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
+
 # ===================== PPI analysis via STRINGdb =====================
 ppi_dir <- file.path(root_dir, "results", "ppi")
 dir.create(ppi_dir, recursive = TRUE, showWarnings = FALSE)
-if (nrow(deg) > 1) {
-  try({
-    string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
-    deg_mapped <- string_db$map(deg, "SYMBOL", removeUnmappedRows = TRUE)
-    if (nrow(deg_mapped) > 1) {
-      ppi_edges <- string_db$get_interactions(deg_mapped$STRING_id)
-      write.csv(ppi_edges, file.path(ppi_dir, "string_interactions.csv"), row.names = FALSE)
-      png(file.path(ppi_dir, "string_network.png"), width = 800, height = 600)
-      string_db$plot_network(deg_mapped$STRING_id)
-      dev.off()
-    }
-  }, silent = TRUE)
-}
-
 deg_for_ppi <- if (exists("melas_res") && !is.null(melas_res$deg_noM_sig)) melas_res$deg_noM_sig else deg
 
-if (nrow(deg_for_ppi) > 0) {
+if (nrow(deg_for_ppi) > 1) {
   try({
     string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
-    deg_mapped <- string_db$map(deg_for_ppi, "ENTREZID", removeUnmappedRows = TRUE)
-    inter <- string_db$get_interactions(deg_mapped$STRING_id)
-    if (nrow(inter) > 0) {
-      g_ppi <- igraph::graph_from_data_frame(inter, directed = FALSE)
+    map_col <- if ("ENTREZID" %in% colnames(deg_for_ppi)) "ENTREZID" else "SYMBOL"
+    deg_mapped <- string_db$map(deg_for_ppi, map_col, removeUnmappedRows = TRUE)
+    if (nrow(deg_mapped) > 1) {
+      hits <- deg_mapped$STRING_id
+      ppi_edges <- string_db$get_interactions(hits)
+      write.csv(ppi_edges, file.path(ppi_dir, "ppi_edges.csv"), row.names = FALSE)
+      g_ppi <- igraph::graph_from_data_frame(ppi_edges, directed = FALSE)
       plt_ppi <- ggraph::ggraph(g_ppi, layout = "fr") +
         ggraph::geom_edge_link(alpha = 0.3) +
         ggraph::geom_node_point(color = "steelblue", size = 3) +
         ggraph::theme_void()
-      ggsave(file.path(root_dir, "results", "plots", "ppi_network.png"), plt_ppi,
-             width = 8, height = 6, dpi = 300)
+      ggsave(file.path(ppi_dir, "ppi_network.png"), plt_ppi, width = 8, height = 6, dpi = 300)
     }
   }, silent = TRUE)
 
@@ -299,20 +289,6 @@ if (nrow(deg_for_ppi) > 0) {
     write.csv(drug_res$matchedTerms,
               file.path(mir_dir, "drug_candidates.csv"), row.names = FALSE)
   }, silent = TRUE)
-}
-
-#======================= Protein-protein interaction network (STRINGdb) =======================
-if (nrow(deg) > 0) {
-  string_db <- STRINGdb::STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
-  mapped_deg <- string_db$map(deg, "SYMBOL", removeUnmappedRows = TRUE)
-  hits <- mapped_deg$STRING_id
-  if (length(hits) > 0) {
-    png(file.path(root_dir, "results", "deg", "ppi_network.png"), width = 10, height = 8, units = "in", res = 300)
-    string_db$plot_network(hits)
-    dev.off()
-    ppi_edges <- string_db$get_interactions(hits)
-    write.csv(ppi_edges, file.path(root_dir, "results", "deg", "ppi_edges.csv"), row.names = FALSE)
-  }
 }
 nrow(tt_all)
 table("SYMBOL_is_NA" = is.na(tt_all$SYMBOL))
@@ -1202,6 +1178,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
