@@ -387,13 +387,6 @@ melas_flag <-
   ( "is_melas" %in% names(pheno_aligned) && to_scalar_logical(pheno_aligned$is_melas) ) ||
   ( "specialcase" %in% names(pheno_aligned) && to_scalar_logical(pheno_aligned$specialcase) )
 
-
-melas_flag <-
-  ( "is_melas" %in% names(pheno_aligned) &&
-      isTRUE(any(tolower(trimws(as.character(pheno_aligned$is_melas))) %in% c("1","true","t","yes","y"), na.rm = TRUE)) ) ||
-  ( "specialcase" %in% names(pheno_aligned) &&
-      isTRUE(any(as.logical(pheno_aligned$specialcase), na.rm = TRUE)) )
-
 pheno_aligned$is_melas <- factor(ifelse(melas_flag, "Yes","No"), levels = c("No","Yes"))
 
 pheno_aligned$group <- factor(pheno_aligned$group, levels = c("Control","Pompe"))
@@ -419,7 +412,6 @@ run_deg_analysis <- function(expr, pheno, run_melas = FALSE,
   out <- list(deg_cov = cov_res,␊
               deg_cov_sig = subset(cov_res, adj.P.Val < fdr_threshold & abs(logFC) >= lfc_threshold))␊
   if (run_melas) {␊
-    keep_idx <- which(
     keep_idx <- which(pheno$is_melas == "No")
     expr_noM <- expr[, keep_idx, drop = FALSE]
     ph_noM   <- droplevels(pheno[keep_idx, ])
@@ -612,13 +604,12 @@ if (length(ranks) < 50) {
   warning("GSEA için yeterli sayıda gen yok gibi (rank < 50). Sonuçlar güvenilmez olabilir.")
 }
 
-msig <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
-#msig <- try(msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP"), silent=TRUE)
-if (inherits(msig, "try-error") || nrow(msig)==0) {
-  msig <- msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP")
-}
-term2gene <- unique(msig[, c("gs_name","gene_symbol")])
-
+msig <- tryCatch(
+  msigdbr(species = "Homo sapiens", collection = "C5", subcollection = "GO:BP"),
+  error = function(e) {
+    msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+  }
+)
 term2gene <- unique(msig[, c("gs_name","gene_symbol")])
 gsea_go <- GSEA(geneList = ranks, TERM2GENE = term2gene,
                 pvalueCutoff = FDR_THRESH, verbose = FALSE)
@@ -1192,6 +1183,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
