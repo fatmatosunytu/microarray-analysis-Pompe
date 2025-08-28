@@ -9,13 +9,13 @@
 
 #========================== Install and load required packages for analysis ===================================
 
-packages <- c(
-  "pkgbuild", "AnnotationDbi", "Biobase", "DOSE", "GEOquery", "GOSemSim", "R.utils",
-  "affy", "annotate", "clusterProfiler", "data.table", "dplyr", "enrichplot",
-  "genefilter", "ggplot2", "ggrepel", "grid", "gridExtra", "hgu133plus2.db",
-  "jsonlite", "limma", "msigdbr", "multiMiR", "org.Hs.eg.db", "pheatmap",
-  "sva", "umap"
-)
+packages <- c(␊
+  "pkgbuild", "AnnotationDbi", "Biobase", "DOSE", "GEOquery", "GOSemSim", "R.utils",␊
+  "affy", "annotate", "clusterProfiler", "data.table", "dplyr", "enrichplot",␊
+  "genefilter", "ggplot2", "ggrepel", "grid", "gridExtra", "hgu133plus2.db",␊
+  "jsonlite", "limma", "msigdbr", "multiMiR", "org.Hs.eg.db", "pheatmap",␊
+  "sva", "umap", "STRINGdb", "rDGIdb"
+)␊
 
 #------------------------   Load required packages; assumes they are already installed   ----------------------
 
@@ -47,10 +47,14 @@ LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
 #-----------------------------   Load CEL files and normalize with RMA    ---------------------------------------------
 
   root_dir <- normalizePath(Sys.getenv("POMPE_ROOT", getwd()), winslash = "/")
-  dir.create(file.path(root_dir, "metadata"), showWarnings = FALSE, recursive = TRUE)
-  meta_dir <- file.path(root_dir, "metadata")
-
-  stopifnot(dir.exists(meta_dir))
+  doc_dir  <- path.expand(file.path("~", "Documents"))
+  meta_candidates <- c(file.path(root_dir, "metadata", "pheno.csv"),
+                       file.path(doc_dir, "pheno.csv"))
+  meta_file <- meta_candidates[file.exists(meta_candidates)][1]
+  if (is.na(meta_file)) {
+    stop("pheno.csv not found in metadata/ or Documents. Run 'git lfs pull' to download the metadata.")
+  }
+  meta_dir <- dirname(meta_file)
 
   dir.create(file.path(root_dir, "results", "qc"),    recursive = TRUE, showWarnings = FALSE)
   dir.create(file.path(root_dir, "results", "deg"),   recursive = TRUE, showWarnings = FALSE)
@@ -62,7 +66,7 @@ LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
 
   set.seed(20240724)
 
-  pheno <- data.table::fread(file.path(meta_dir, "pheno.csv"), na.strings = c("", "NA", "NaN"))
+  pheno <- data.table::fread(meta_file, na.strings = c("", "NA", "NaN"))
 
 pheno$filename <- basename(trimws(pheno$filename))
 cel_dir   <- meta_dir
@@ -139,12 +143,10 @@ ggplot2::ggsave(file.path(root_dir,"results","qc","pca_groups_batches.png"), gg,
 
 #========================== Identify differentially expressed genes with limma ===================================
 
-expr_cb <- if (exists("expr_f")) expr_f else expr   
+expr_cb <- if (exists("expr_f")) expr_f else expr
 stopifnot(is.matrix(expr_cb))
 stopifnot(exists("design"))
-stopifnot(ncol(expr_cb) == nrow(design))           
-
-expr_cb <- if (exists("expr_f")) expr_f else expr  
+stopifnot(ncol(expr_cb) == nrow(design))
 stopifnot(exists("pheno_aligned"))
 groups <- factor(pheno_aligned$group, levels = c("Control","Pompe"))
 
@@ -249,6 +251,19 @@ write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
 write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
 write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
 
+#======================= Protein-protein interaction network (STRINGdb) =======================
+if (nrow(deg) > 0) {
+  string_db <- STRINGdb::STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+  mapped_deg <- string_db$map(deg, "SYMBOL", removeUnmappedRows = TRUE)
+  hits <- mapped_deg$STRING_id
+  if (length(hits) > 0) {
+    png(file.path(root_dir, "results", "deg", "ppi_network.png"), width = 10, height = 8, units = "in", res = 300)
+    string_db$plot_network(hits)
+    dev.off()
+    ppi_edges <- string_db$get_interactions(hits)
+    write.csv(ppi_edges, file.path(root_dir, "results", "deg", "ppi_edges.csv"), row.names = FALSE)
+  }
+}
 nrow(tt_all)
 table("SYMBOL_is_NA" = is.na(tt_all$SYMBOL))
 mean(!is.na(tt_all$SYMBOL))  # kapsama oranı
@@ -1021,6 +1036,8 @@ writeLines("WARNING: small sample size (9 Pompe vs 10 Control). Interpret with c
            file.path(mir_dir, "_NOTE_small_n.txt"))
 
 sig_syms <- if (exists("deg")) head(unique(deg$SYMBOL), 50) else character(0)
+dfv <- data.frame()
+dfp <- data.frame()
 if (length(sig_syms) < 2) {
   message("[miRNA] Yeterli anlamlı gen yok; multiMiR adımları atlandı.")
 } else {
@@ -1066,7 +1083,7 @@ if (length(sig_syms) < 2) {
   )
   if (!is.null(mm_pred) && nrow(mm_pred@data) > 0) {
     dfp <- mm_pred@data
-   dfp$FDR <- p.adjust(dfp&p_value, method = "BH")
+   dfp$FDR <- p.adjust(dfp$p_value, method = "BH")
     
     pltp <- dfp |>
       dplyr::count(database, mature_mirna_id, name="Target_Count") |>
@@ -1086,6 +1103,18 @@ if (length(sig_syms) < 2) {
   }
 }
 
+#================= Drug discovery for miRNA targets (rDGIdb) ==================
+genes_for_drug <- unique(c(dfv$target_symbol,
+                           if (exists("dfp")) dfp$target_symbol else NULL))
+genes_for_drug <- genes_for_drug[!is.na(genes_for_drug)]
+if (length(genes_for_drug) > 0) {
+  dg <- tryCatch(rDGIdb::queryDGIdb(genes_for_drug), error = function(e) NULL)
+  if (!is.null(dg) && nrow(dg$matchedTerms) > 0) {
+    write.csv(dg$matchedTerms,
+              file.path(mir_dir, "miRNA_target_drugs.csv"), row.names = FALSE)
+  }
+}
+
 expr2 <- na.omit(expr_use)
 expr2 <- expr2[!duplicated(rownames(expr2)), ]
 set.seed(123)
@@ -1102,3 +1131,4 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
