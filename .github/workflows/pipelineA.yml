@@ -1,0 +1,24 @@
+name: Pipeline A
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Git LFS
+        run: git lfs install --local
+
+      - name: Pull LFS objects
+        run: git lfs pull
+
+      - name: Verify LFS files
+        run: git lfs ls-files --name-only
+
+      - name: Run analysis
+        run: Rscript microarray_analysis_pompe.R
