@@ -62,16 +62,19 @@ LOGFC_THRESH <- if (length(args) >= 2) as.numeric(args[2]) else 0.5
 
   set.seed(20240724)
 
-  doc_file  <- file.path(path.expand("~/Documents"), "pheno.csv")
-  meta_file <- file.path(meta_dir, "pheno.csv")
-  if (!file.exists(meta_file)) {
-    if (file.exists(doc_file)) {
-      file.copy(doc_file, meta_file, overwrite = TRUE)
+  doc_file <- file.path(Sys.getenv("HOME"), "Documents", "pheno.csv")
+  if (!file.exists(doc_file)) {
+    metadata_url <- "https://example.com/pheno.csv"  # replace with actual download link
+    dir.create(dirname(doc_file), recursive = TRUE, showWarnings = FALSE)
+    utils::download.file(metadata_url, doc_file, mode = "wb")
+  }
+  file.copy(doc_file, file.path(meta_dir, "pheno.csv"), overwrite = TRUE)
+  pheno <- data.table::fread(file.path(meta_dir, "pheno.csv"),
+                             na.strings = c("", "NA", "NaN"))
     } else {
       stop("pheno.csv not found. Ensure metadata is downloaded via Git LFS to ~/Documents.")
     }
   }
-  pheno <- data.table::fread(meta_file, na.strings = c("", "NA", "NaN"))
 
 pheno$filename <- basename(trimws(pheno$filename))
 cel_dir   <- meta_dir
@@ -91,6 +94,12 @@ stopifnot(!any(is.na(pheno$group)))
 if (!"is_melas" %in% names(pheno)) pheno$is_melas <- FALSE
 pheno$is_melas <- tolower(trimws(as.character(pheno$is_melas))) %in%
   c("1","true","t","yes","y")
+
+melas_idx <- which(pheno$is_melas)
+if (length(melas_idx) > 1) {
+  warning("More than one MELAS sample detected; using the first flagged sample.")
+  melas_idx <- melas_idx[1]
+}
 
 if (!"batch" %in% names(pheno)) pheno$batch <- NA
 
@@ -149,14 +158,11 @@ ggplot2::ggsave(file.path(root_dir,"results","qc","pca_groups_batches.png"), gg,
 #========================== Identify differentially expressed genes with limma ===================================
 
 expr_cb <- if (exists("expr_f")) expr_f else expr
+stopifnot(is.matrix(expr_cb))
 stopifnot(exists("pheno_aligned"))
 groups <- factor(pheno_aligned$group, levels = c("Control","Pompe"))
-
-design <- model.matrix(~ 0 + groups)
+design <- model.matrix(~0 + groups)
 colnames(design) <- c("Control","Pompe")
-
-stopifnot(is.matrix(expr_cb))
-stopifnot(is.matrix(design))
 stopifnot(ncol(expr_cb) == nrow(design))
 
 print(dim(expr_cb)); print(dim(design)); head(design)
@@ -252,6 +258,23 @@ down_n <- sum(deg$logFC < 0, na.rm = TRUE)
 write.csv(tt_all,  file.path(root_dir,"results","deg","all_probes_BH.csv"))
 write.csv(tt_gene, file.path(root_dir,"results","deg","collapsed_by_gene.csv"), row.names = TRUE)
 write.csv(deg,     file.path(root_dir,"results","deg", sprintf("DEG_FDR_lt_%s.csv", FDR_THRESH)), row.names = TRUE)
+
+# ===================== PPI analysis via STRINGdb =====================
+ppi_dir <- file.path(root_dir, "results", "ppi")
+dir.create(ppi_dir, recursive = TRUE, showWarnings = FALSE)
+if (nrow(deg) > 1) {
+  try({
+    string_db <- STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+    deg_mapped <- string_db$map(deg, "SYMBOL", removeUnmappedRows = TRUE)
+    if (nrow(deg_mapped) > 1) {
+      ppi_edges <- string_db$get_interactions(deg_mapped$STRING_id)
+      write.csv(ppi_edges, file.path(ppi_dir, "string_interactions.csv"), row.names = FALSE)
+      png(file.path(ppi_dir, "string_network.png"), width = 800, height = 600)
+      string_db$plot_network(deg_mapped$STRING_id)
+      dev.off()
+    }
+  }, silent = TRUE)
+}
 
 deg_for_ppi <- if (exists("melas_res") && !is.null(melas_res$deg_noM_sig)) melas_res$deg_noM_sig else deg
 
@@ -1164,5 +1187,6 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
