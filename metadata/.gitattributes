@@ -1,3 +1,0 @@
-*.CEL filter=lfs diff=lfs merge=lfs -text
-*.CEL.gz filter=lfs diff=lfs merge=lfs -text
-*.CHP filter=lfs diff=lfs merge=lfs -text
