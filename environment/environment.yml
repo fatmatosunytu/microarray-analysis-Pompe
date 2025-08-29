@@ -1,1 +1,37 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a//dev/null b/environment/environment.yml
+index 0000000000000000000000000000000000000000..7d59e63f9bc9a754f2fcbe2ed33b0fd090b39a1b 100644
+--- a//dev/null
++++ b/environment/environment.yml
+@@ -0,0 +1,20 @@
++name: pompe
++channels:
++  - conda-forge
++  - bioconda
++dependencies:
++  - r-base=4.3
++  - bioconductor-affy
++  - bioconductor-limma
++  - bioconductor-hgu133plus2.db
++  - bioconductor-clusterprofiler
++  - bioconductor-org.hs.eg.db
++  - bioconductor-multimir
++  - bioconductor-stringdb
++  - bioconductor-enrichplot
++  - bioconductor-dose
++  - bioconductor-gosemsim
++  - r-data.table
++  - r-ggplot2
++  - r-dplyr
++  - r-tidyr
++  - r-jsonlite
++  - r-ggrepel
++  - r-umap
++  - r-tidygraph
++  - r-rdgidb
 
+   - pip
+  - pip:
+      - pre-commit
+EOF
+)
