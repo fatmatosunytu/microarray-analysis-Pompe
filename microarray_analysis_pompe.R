@@ -9,6 +9,23 @@
 
 #========================== Install and load required packages for analysis ===================================
 
+# ---- INPUT PATHS ----
+root_dir  <- getwd()
+meta_dir  <- file.path(root_dir, "metadata")
+
+cel_files <- list.files(meta_dir, pattern = "\\.CEL$", full.names = TRUE)
+pheno_csv <- file.path(meta_dir, "pheno.csv")
+
+# (opsiyonel) pheno dosyası varsa oku
+if (file.exists(pheno_csv)) {
+  pheno <- read.csv(pheno_csv, stringsAsFactors = FALSE)
+}
+
+# Affymetrix okumaları
+library(affy)  # veya oligo platformuna göre
+raw <- ReadAffy(filenames = cel_files)
+# ... RMA, QC, batch correction, limma vs. burada devam ...
+
 packages <- c(␊
   "pkgbuild", "AnnotationDbi", "Biobase", "DOSE", "GEOquery", "GOSemSim", "R.utils",␊
   "affy", "annotate", "clusterProfiler", "data.table", "dplyr", "enrichplot",␊
@@ -1183,6 +1200,7 @@ meta_mir <- list(dataset="GSE38680", n_pompe=sum(groups=="Pompe"),
                  n_control=sum(groups=="Control"), adj="BH",
                  note_small_n=TRUE, date=as.character(Sys.Date()))
 jsonlite::write_json(meta_mir, file.path(mir_dir, "_analysis_meta.json"), pretty=TRUE)
+
 
 
 
