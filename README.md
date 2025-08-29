@@ -104,6 +104,11 @@ Figures resembling those in the referenced manuscript are generated throughout
 - Only one individual is flagged as MELAS in `pheno.csv`; sensitivity analyses automatically
   exclude this sample.
 - Ensure Git LFS is set up before committing or pulling large metadata files.
+
+  ## Data via Git LFS
+After cloning:
+  git lfs install
+  git lfs pull
   
 ## Citation
 If you use this pipeline, please cite:
