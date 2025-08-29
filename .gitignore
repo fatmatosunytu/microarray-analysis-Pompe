@@ -1,0 +1,4 @@
+printf "results/\nplots/\n*.Rproj.user/\n" >> .gitignore
+git add .gitignore
+git commit -m "chore: ignore results/ and plots/"
+git push
