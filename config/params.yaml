@@ -1,0 +1,18 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a//dev/null b/config/params.yaml
+index 0000000000000000000000000000000000000000..4391bfd86a88fc87bc31f550812074c12aca78ef 100644
+--- a//dev/null
++++ b/config/params.yaml
+@@ -0,0 +1,9 @@
++deg:
++  design: "~ 0 + group"
++  contrast: "Pompe - Control"
++  logFC: 1.0
++  padj: 0.05
++plots:
++  volcano_topn: 20
++enrichment:
++  ontologies: ["BP", "CC", "MF"]
+ 
+EOF
+)
