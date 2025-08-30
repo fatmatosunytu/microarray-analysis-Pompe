@@ -24,6 +24,6 @@ dependencies:
   - r-tidygraph
   - r-rdgidb
 
-   - pip
-  - pip:
-      - pre-commit
+  - pip
+- pip:
+  - pre-commit
