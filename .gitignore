@@ -1,4 +1,15 @@
-printf "results/\nplots/\n*.Rproj.user/\n" >> .gitignore
-git add .gitignore
-git commit -m "chore: ignore results/ and plots/"
-git push
+# Ignore analysis outputs
+results/
+plots/
+logs/
+
+# R/RStudio files
+*.Rhistory
+*.Rproj.user/
+.RData
+
+# Python caches
+__pycache__/
+
+# OS
+.DS_Store
