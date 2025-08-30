@@ -1,6 +1,4 @@
-sample_id,filename,group,age,sex,notes
-GSM947461,GSM947461_H0013501.CEL,Pompe,6,M,biopsy
-GSM947462,GSM947462_H0013502.CEL,Control,7,F,biopsy 
+
 sample,group,filename,batch,sex,rin,is_melas,age_at_baseline_mounth,specialcase
 GSM947461,Control,GSM947461_H0013501.CEL,1,M,,,14,0
 GSM947462,Control,GSM947462_H0013502.CEL,1,M,,,23,0
