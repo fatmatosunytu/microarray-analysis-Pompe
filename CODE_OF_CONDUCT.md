@@ -1,8 +1,7 @@
-
-+# Contributor Covenant Code of Conduct+
-+## Our Pledge
-+We as members, contributors, and leaders pledge to make participation in our
-+community a harassment-free experience for everyone, regardless of age, body
+# Contributor Covenant Code of Conduct+
+## Our Pledge
+We as members, contributors, and leaders pledge to make participation in our
+community a harassment-free experience for everyone, regardless of age, body
 +size, visible or invisible disability, ethnicity, level of experience, education, socio-economic status,
 +nationality, personal appearance, race, religion.
 +
