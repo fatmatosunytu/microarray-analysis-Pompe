@@ -1,26 +1,16 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a//dev/null b/CITATION.cff
-index 0000000000000000000000000000000000000000..c16aa25216f17fc668460f30613f40d1bf533ef2 100644
---- a//dev/null
-+++ b/CITATION.cff
-@@ -0,0 +1,11 @@
 +cff-version: 1.2.0
-+title: "Pompe Disease Microarray Transcriptomics Analysis"
-+message: "If you use this project, please cite it as below."
-+authors:
-+  - family-names: Tosun
-+    given-names: Fatma
-+  - family-names: Bayrak
-+    given-names: Harun
-+license: MIT
-+version: 1.0.0
-+date-released: "2025-01-01"
+title: "Pompe Disease Microarray Transcriptomics Analysis"
+message: "If you use this project, please cite it as below."
+authors:
+  - family-names: Tosun
+    given-names: Fatma
+  - family-names: Bayrak
+    given-names: Harun
+license: MIT
+version: 1.0.0
+date-released: "2025-01-01"
 keywords:
   - Pompe disease
   - GSE38680
   - microarray
 url: "https://github.com/example/microarray-analysis-Pompe"
-
-
-EOF
-)
