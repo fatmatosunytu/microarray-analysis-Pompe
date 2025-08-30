@@ -1,11 +1,5 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a//dev/null b/CODE_OF_CONDUCT.md
-index 0000000000000000000000000000000000000000..ca11a580d753fe82eb025acad905deb165ea6c4d 100644
---- a//dev/null
-+++ b/CODE_OF_CONDUCT.md
-@@ -0,0 +1,57 @@
-+# Contributor Covenant Code of Conduct
-+
+
++# Contributor Covenant Code of Conduct+
 +## Our Pledge
 +We as members, contributors, and leaders pledge to make participation in our
 +community a harassment-free experience for everyone, regardless of age, body
@@ -57,6 +51,3 @@ index 0000000000000000000000000000000000000000..ca11a580d753fe82eb025acad905deb1
 +version 2.1.
 +
 +[homepage]: https://www.contributor-covenant.org
- 
-EOF
-)
