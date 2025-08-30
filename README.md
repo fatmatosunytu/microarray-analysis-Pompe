@@ -46,6 +46,3 @@ Please cite:
 >Tosun F., Bayrak H. 2025. *Transcriptomic and Functional Analysis of Pompe Disease*.
 
 See `CITATION.cff` for machine‑readable metadata.
-
-## License
-MIT
